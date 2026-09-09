@@ -3,24 +3,27 @@ import { AwsClient } from "aws4fetch";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const MAX_UPLOAD_EXPIRY = 900;
 
-function corsHeaders(env) {
+function corsHeaders(env, requestOrigin = null) {
+  const appOrigin = env.APP_ORIGIN || "https://flaynity.indevs.in";
+  const allowedOrigins = new Set([appOrigin, "null"]);
+  const origin = requestOrigin && allowedOrigins.has(requestOrigin) ? requestOrigin : appOrigin;
   return {
-    "Access-Control-Allow-Origin": env.APP_ORIGIN || "https://flaynity.indevs.in",
-    "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET,HEAD,POST,PUT,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
   };
 }
 
-function json(data, status = 200, env) {
+function json(data, status = 200, env, requestOrigin = null) {
   const headers = new Headers(JSON_HEADERS);
-  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
+  Object.entries(corsHeaders(env, requestOrigin)).forEach(([k, v]) => headers.set(k, v));
   return new Response(JSON.stringify(data), { status, headers });
 }
 
-function unauthorized(env, message = "Unauthorized") {
-  return json({ error: message }, 401, env);
+function unauthorized(env, message = "Unauthorized", requestOrigin = null) {
+  return json({ error: message }, 401, env, requestOrigin);
 }
 
 function base64UrlDecode(value) {
@@ -108,19 +111,19 @@ async function handleUploadUrl(request, env) {
   try {
     await verifyFirebaseToken(request, env);
   } catch (e) {
-    return unauthorized(env, e.message || "Unauthorized");
+    return unauthorized(env, e.message || "Unauthorized", request.headers.get("Origin"));
   }
 
   let body;
   try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400, env); }
   const key = sanitizeKey(body.key);
   const contentType = String(body.contentType || "application/octet-stream").slice(0, 120);
-  if (!key) return json({ error: "Invalid media key" }, 400, env);
-  if (!/^(image|video|audio)\//i.test(contentType)) return json({ error: "Unsupported content type" }, 400, env);
+  if (!key) return json({ error: "Invalid media key" }, 400, env, request.headers.get("Origin"));
+  if (!/^(image|video|audio)\//i.test(contentType)) return json({ error: "Unsupported content type" }, 400, env, request.headers.get("Origin"));
 
   const uploadUrl = await createPresignedPut(env, key, contentType);
   const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`;
-  return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env);
+  return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env, request.headers.get("Origin"));
 }
 
 async function handleMedia(request, env, key) {
@@ -132,7 +135,7 @@ async function handleMedia(request, env, key) {
   headers.set("etag", obj.httpEtag);
   headers.set("Accept-Ranges", "bytes");
   headers.set("Cache-Control", "public, max-age=31536000, immutable");
-  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
+  Object.entries(corsHeaders(env, request.headers.get("Origin"))).forEach(([k, v]) => headers.set(k, v));
 
   const status = obj.range ? 206 : 200;
   if (obj.range) {
@@ -150,7 +153,7 @@ async function handleMedia(request, env, key) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env, request.headers.get("Origin")) });
 
     if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", time: Date.now() }, 200, env);
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);

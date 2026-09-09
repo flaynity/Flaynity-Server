@@ -44,41 +44,26 @@ function decodeJwt(token) {
 }
 
 let certCache = { expiresAt: 0, keys: new Map() };
-const JWKS_CACHE_SECONDS = 300;
 
 async function fetchGoogleJwks(forceRefresh = false) {
   const url = forceRefresh
-    ? `https://www.googleapis.com/oauth2/v3/certs?flaynity_refresh=${Date.now()}_${Math.random().toString(36).slice(2)}`
+    ? `https://www.googleapis.com/oauth2/v3/certs?flaynity_refresh=${Date.now()}`
     : "https://www.googleapis.com/oauth2/v3/certs";
-
-  const response = await fetch(url, {
-    headers: {
-      "Cache-Control": forceRefresh ? "no-cache" : "max-age=300"
-    },
-    ...(forceRefresh ? { cache: "no-store" } : { cf: { cacheTtl: JWKS_CACHE_SECONDS } })
-  });
-
+  const response = await fetch(url, forceRefresh
+    ? { cache: "no-store", headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" } }
+    : { cf: { cacheTtl: 3600 } });
   if (!response.ok) throw new Error("Could not load Google signing keys");
   const body = await response.json();
   const keys = new Map();
-
   for (const jwk of body.keys || []) {
-    if (jwk.kty === "RSA" && jwk.kid && jwk.n && jwk.e) {
+    if (jwk.kty === "RSA" && jwk.kid) {
       keys.set(jwk.kid, await crypto.subtle.importKey(
-        "jwk",
-        jwk,
-        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-        false,
-        ["verify"]
+        "jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]
       ));
     }
   }
-
-  if (!keys.size) throw new Error("Google signing keys unavailable");
-
-  const headerMaxAge = Number((response.headers.get("cache-control") || "").match(/max-age=(\d+)/)?.[1] || JWKS_CACHE_SECONDS);
-  const cacheSeconds = Math.min(Math.max(headerMaxAge, 60), JWKS_CACHE_SECONDS);
-  certCache = { expiresAt: Date.now() + cacheSeconds * 1000, keys };
+  const maxAge = Number((response.headers.get("cache-control") || "").match(/max-age=(\d+)/)?.[1] || 3600);
+  certCache = { expiresAt: Date.now() + Math.min(maxAge, 3600) * 1000, keys };
   return keys;
 }
 
@@ -93,7 +78,6 @@ async function verifyFirebaseToken(request, env) {
   const token = auth.slice(7).trim();
   const { header, payload, signature, signingInput } = decodeJwt(token);
   if (header.alg !== "RS256" || !header.kid) throw new Error("Invalid token header");
-
   let keys = await getGoogleJwks();
   let key = keys.get(header.kid);
 
@@ -153,13 +137,9 @@ async function handleUploadUrl(request, env) {
   if (!key) return json({ error: "Invalid media key" }, 400, env);
   if (!/^(image|video|audio)\//i.test(contentType)) return json({ error: "Unsupported content type" }, 400, env);
 
-  try {
-    const uploadUrl = await createPresignedPut(env, key, contentType);
-    const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`;
-    return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not create upload URL" }, 500, env);
-  }
+  const uploadUrl = await createPresignedPut(env, key, contentType);
+  const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`;
+  return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env);
 }
 
 async function handleMedia(request, env, key) {

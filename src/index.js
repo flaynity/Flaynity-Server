@@ -44,26 +44,41 @@ function decodeJwt(token) {
 }
 
 let certCache = { expiresAt: 0, keys: new Map() };
+const JWKS_CACHE_SECONDS = 300;
 
 async function fetchGoogleJwks(forceRefresh = false) {
   const url = forceRefresh
-    ? `https://www.googleapis.com/oauth2/v3/certs?flaynity_refresh=${Date.now()}`
+    ? `https://www.googleapis.com/oauth2/v3/certs?flaynity_refresh=${Date.now()}_${Math.random().toString(36).slice(2)}`
     : "https://www.googleapis.com/oauth2/v3/certs";
-  const response = await fetch(url, forceRefresh
-    ? { cache: "no-store", headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" } }
-    : { cf: { cacheTtl: 3600 } });
+
+  const response = await fetch(url, {
+    headers: {
+      "Cache-Control": forceRefresh ? "no-cache" : "max-age=300"
+    },
+    ...(forceRefresh ? { cache: "no-store" } : { cf: { cacheTtl: JWKS_CACHE_SECONDS } })
+  });
+
   if (!response.ok) throw new Error("Could not load Google signing keys");
   const body = await response.json();
   const keys = new Map();
+
   for (const jwk of body.keys || []) {
-    if (jwk.kty === "RSA" && jwk.kid) {
+    if (jwk.kty === "RSA" && jwk.kid && jwk.n && jwk.e) {
       keys.set(jwk.kid, await crypto.subtle.importKey(
-        "jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]
+        "jwk",
+        jwk,
+        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        false,
+        ["verify"]
       ));
     }
   }
-  const maxAge = Number((response.headers.get("cache-control") || "").match(/max-age=(\d+)/)?.[1] || 3600);
-  certCache = { expiresAt: Date.now() + Math.min(maxAge, 3600) * 1000, keys };
+
+  if (!keys.size) throw new Error("Google signing keys unavailable");
+
+  const headerMaxAge = Number((response.headers.get("cache-control") || "").match(/max-age=(\d+)/)?.[1] || JWKS_CACHE_SECONDS);
+  const cacheSeconds = Math.min(Math.max(headerMaxAge, 60), JWKS_CACHE_SECONDS);
+  certCache = { expiresAt: Date.now() + cacheSeconds * 1000, keys };
   return keys;
 }
 
@@ -73,33 +88,71 @@ async function getGoogleJwks(forceRefresh = false) {
 }
 
 async function verifyFirebaseToken(request, env) {
-  const auth = request.headers.get("Authorization") || "";
-  if (!auth.startsWith("Bearer ")) throw new Error("Missing bearer token");
-  const token = auth.slice(7).trim();
-  const { header, payload, signature, signingInput } = decodeJwt(token);
-  if (header.alg !== "RS256" || !header.kid) throw new Error("Invalid token header");
-  let keys = await getGoogleJwks();
-  let key = keys.get(header.kid);
+  const authHeader = request.headers.get("Authorization") || "";
+  if (!/^Bearer\s+/i.test(authHeader)) throw new Error("Authentication token missing");
+  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!token) throw new Error("Authentication token missing");
 
-  // Google rotates Firebase signing keys. If the cached JWKS does not contain
-  // the token's kid, refresh the keys immediately before rejecting the token.
-  if (!key) {
-    keys = await getGoogleJwks(true);
-    key = keys.get(header.kid);
+  // Primary path: locally verify the Firebase ID token using Google's public
+  // signing keys. A missing kid is handled by an immediate JWKS refresh.
+  try {
+    const { header, payload, signature, signingInput } = decodeJwt(token);
+    if (header.alg !== "RS256" || !header.kid) throw new Error("Invalid authentication token header");
+
+    let keys = await getGoogleJwks();
+    let key = keys.get(header.kid);
+    if (!key) {
+      keys = await getGoogleJwks(true);
+      key = keys.get(header.kid);
+    }
+    if (!key) throw new Error("Unknown token key");
+
+    const valid = await crypto.subtle.verify(
+      { name: "RSASSA-PKCS1-v1_5" }, key, signature, signingInput
+    );
+    if (!valid) throw new Error("Invalid token signature");
+
+    const now = Math.floor(Date.now() / 1000);
+    if (!payload.exp || payload.exp <= now) throw new Error("Authentication token expired");
+    if (payload.iat && payload.iat > now + 60) throw new Error("Authentication token issued in the future");
+    if (payload.aud !== env.FIREBASE_PROJECT_ID) throw new Error("Authentication token has wrong audience");
+    if (payload.iss !== `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) throw new Error("Authentication token has wrong issuer");
+    if (!payload.sub) throw new Error("Authentication token has no user id");
+    return payload;
+  } catch (primaryError) {
+    // Fallback: ask Firebase Identity Toolkit to validate the ID token itself.
+    // This is used only when local Google-key verification fails (for example
+    // during a signing-key rotation/cache propagation window). The Firebase
+    // Web API key is a public application identifier, not an R2 credential.
+    try {
+      const firebaseApiKey = env.FIREBASE_WEB_API_KEY || "AIzaSyCiUTQp_QDSbBIOGJXKI7jJmzQHPu8L14I";
+      const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseApiKey)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ idToken: token }),
+        cache: "no-store"
+      });
+      if (response.ok) {
+        const info = await response.json();
+        const account = Array.isArray(info.users) ? info.users[0] : null;
+        if (account && account.localId) {
+          return {
+            sub: account.localId,
+            user_id: account.localId,
+            aud: env.FIREBASE_PROJECT_ID,
+            iss: `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`,
+            email: account.email || undefined,
+            email_verified: !!account.emailVerified,
+            auth_time: account.lastLoginAt ? Math.floor(Number(account.lastLoginAt) / 1000) : undefined
+          };
+        }
+      }
+    } catch (fallbackError) {
+      // Fall through to the original verification error.
+    }
+    throw primaryError;
   }
-  if (!key) throw new Error("Unknown token key");
-
-  const valid = await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, key, signature, signingInput);
-  if (!valid) throw new Error("Invalid token signature");
-
-  const now = Math.floor(Date.now() / 1000);
-  if (payload.exp <= now || payload.iat > now + 60) throw new Error("Expired token");
-  if (payload.aud !== env.FIREBASE_PROJECT_ID) throw new Error("Wrong audience");
-  if (payload.iss !== `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) throw new Error("Wrong issuer");
-  if (!payload.sub) throw new Error("Missing user id");
-  return payload;
 }
-
 function sanitizeKey(input) {
   const key = String(input || "").replace(/^\/+/, "");
   if (!key || key.length > 700 || key.includes("..") || !/^uploads\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/.test(key)) return null;
@@ -137,9 +190,13 @@ async function handleUploadUrl(request, env) {
   if (!key) return json({ error: "Invalid media key" }, 400, env);
   if (!/^(image|video|audio)\//i.test(contentType)) return json({ error: "Unsupported content type" }, 400, env);
 
-  const uploadUrl = await createPresignedPut(env, key, contentType);
-  const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`;
-  return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env);
+  try {
+    const uploadUrl = await createPresignedPut(env, key, contentType);
+    const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`;
+    return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env);
+  } catch (e) {
+    return json({ error: e?.message || "Could not create upload URL" }, 500, env);
+  }
 }
 
 async function handleMedia(request, env, key) {

@@ -176,6 +176,119 @@ async function createPresignedPut(env, key, contentType) {
   return signed.url.toString();
 }
 
+
+
+async function streamAuth(request, env) {
+  try { return await verifyFirebaseToken(request, env); }
+  catch (e) { return { error: e }; }
+}
+
+async function streamApiFetch(env, path, options = {}) {
+  const token = env.CLOUDFLARE_STREAM_API_TOKEN;
+  if (!token) throw new Error("Cloudflare Stream is not configured. Add CLOUDFLARE_STREAM_API_TOKEN as a Worker secret.");
+  const account = env.R2_ACCOUNT_ID;
+  if (!account) throw new Error("Cloudflare account ID is missing.");
+  const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/stream${path}`, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const body = await response.json().catch(() => ({}));
+  return { response, body };
+}
+
+async function handleStreamUploadUrl(request, env) {
+  const authResult = await streamAuth(request, env);
+  if (authResult.error) return unauthorized(env, authResult.error.message || "Unauthorized");
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400, env); }
+  const maxDurationSeconds = Math.min(Math.max(Number(body.maxDurationSeconds) || 3600, 1), 36000);
+  const creator = String(authResult.sub || "").slice(0, 64);
+  const name = String(body.name || "flaynity-video.mp4").slice(0, 180);
+  const allowedOrigin = (() => { try { return new URL(env.APP_ORIGIN || "https://flaynity.indevs.in").hostname; } catch { return "flaynity.indevs.in"; } })();
+  try {
+    const result = await streamApiFetch(env, "/direct_upload", {
+      method: "POST",
+      body: JSON.stringify({
+        maxDurationSeconds,
+        creator,
+        allowedOrigins: [allowedOrigin],
+        meta: { name }
+      })
+    });
+    if (!result.response.ok || !result.body?.success) {
+      const msg = result.body?.errors?.[0]?.message || `Stream upload URL failed (${result.response.status})`;
+      return json({ error: msg }, 502, env);
+    }
+    return json({ uid: result.body.result.uid, uploadUrl: result.body.result.uploadURL, mode: "post" }, 200, env);
+  } catch (e) { return json({ error: e.message || "Could not create Stream upload URL" }, 503, env); }
+}
+
+async function handleStreamTusUrl(request, env) {
+  const authResult = await streamAuth(request, env);
+  if (authResult.error) return unauthorized(env, authResult.error.message || "Unauthorized");
+  const length = request.headers.get("Upload-Length");
+  if (!length || !/^\d+$/.test(length)) return json({ error: "Upload-Length is required" }, 400, env);
+  const name = String(request.headers.get("X-Flaynity-Filename") || "flaynity-video.mp4").slice(0, 180);
+  const creator = String(authResult.sub || "").slice(0, 64);
+  const allowedOrigin = (() => { try { return new URL(env.APP_ORIGIN || "https://flaynity.indevs.in").hostname; } catch { return "flaynity.indevs.in"; } })();
+  const meta = [
+    `name ${btoa(unescape(encodeURIComponent(name)))}`,
+    `maxdurationseconds ${btoa("36000")}`,
+    `allowedorigins ${btoa(allowedOrigin)}`
+  ].join(",");
+  try {
+    const result = await streamApiFetch(env, "?direct_user=true", {
+      method: "POST",
+      headers: {
+        "Tus-Resumable": "1.0.0",
+        "Upload-Length": length,
+        "Upload-Metadata": meta,
+        "Upload-Creator": creator
+      },
+      body: undefined
+    });
+    const location = result.response.headers.get("Location");
+    const mediaId = result.response.headers.get("stream-media-id");
+    if (!result.response.ok || !location) {
+      const msg = result.body?.errors?.[0]?.message || `Stream TUS initialization failed (${result.response.status})`;
+      return json({ error: msg }, 502, env);
+    }
+    const headers = new Headers(corsHeaders(env));
+    headers.set("content-type", "application/json; charset=utf-8");
+    return new Response(JSON.stringify({ uid: mediaId || null, uploadUrl: location, mode: "tus" }), { status: 200, headers });
+  } catch (e) { return json({ error: e.message || "Could not create Stream TUS upload URL" }, 503, env); }
+}
+
+async function handleStreamStatus(request, env, uid) {
+  const authResult = await streamAuth(request, env);
+  if (authResult.error) return unauthorized(env, authResult.error.message || "Unauthorized");
+  if (!/^[a-zA-Z0-9_-]{20,80}$/.test(uid)) return json({ error: "Invalid Stream video ID" }, 400, env);
+  try {
+    const result = await streamApiFetch(env, `/${encodeURIComponent(uid)}`, { method: "GET" });
+    if (!result.response.ok || !result.body?.success) {
+      const msg = result.body?.errors?.[0]?.message || `Stream status failed (${result.response.status})`;
+      return json({ error: msg }, result.response.status === 404 ? 404 : 502, env);
+    }
+    const v = result.body.result || {};
+    return json({
+      uid: v.uid,
+      readyToStream: !!v.readyToStream,
+      readyToStreamAt: v.readyToStreamAt || null,
+      status: v.status || null,
+      hls: v.playback?.hls || v.hls || null,
+      dash: v.playback?.dash || v.dash || null,
+      thumbnail: v.thumbnail || null,
+      duration: v.duration || null,
+      width: v.input?.width || v.width || null,
+      height: v.input?.height || v.height || null
+    }, 200, env);
+  } catch (e) { return json({ error: e.message || "Could not read Stream status" }, 503, env); }
+}
+
 async function handleUploadUrl(request, env) {
   try {
     await verifyFirebaseToken(request, env);
@@ -230,6 +343,9 @@ export default {
 
     if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", time: Date.now() }, 200, env);
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
+    if (url.pathname === "/api/v1/stream/upload-url" && request.method === "POST") return handleStreamUploadUrl(request, env);
+    if (url.pathname === "/api/v1/stream/tus-url" && request.method === "POST") return handleStreamTusUrl(request, env);
+    if (url.pathname.startsWith("/api/v1/stream/status/") && request.method === "GET") return handleStreamStatus(request, env, url.pathname.slice("/api/v1/stream/status/".length));
 
     if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {
       const key = decodeURIComponent(url.pathname.slice("/media/".length));

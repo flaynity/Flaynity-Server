@@ -314,7 +314,7 @@ async function handleDirectImageUpload(request, env) {
 
   const rawKey = String(request.headers.get("X-Flaynity-Key") || "");
   const key = sanitizeKey(rawKey);
-  if (!key || !/^uploads\/images\/[a-zA-Z0-9._\/-]+$/.test(key) || key.includes("..")) {
+  if (!key || !/^uploads\/(?:images|posts|avatars|banners)\/[a-zA-Z0-9._\/-]+$/.test(key) || key.includes("..")) {
     return json({ error: "Invalid image key" }, 400, env);
   }
 
@@ -326,7 +326,7 @@ async function handleDirectImageUpload(request, env) {
     await env.MEDIA_BUCKET.put(key, request.body, {
       httpMetadata: { contentType }
     });
-    const mediaBase = env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in";
+    const mediaBase = env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in/media";
     const publicUrl = `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`;
     return json({ ok: true, key, publicUrl }, 200, env);
   } catch (e) {
@@ -352,7 +352,7 @@ async function handleUploadUrl(request, env) {
     const uploadUrl = await createPresignedPut(env, key, contentType);
     // Prefer the direct R2 Custom Domain in production. The Worker /media proxy
     // remains available for backward compatibility with older stored URLs.
-    const mediaBase = env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in";
+    const mediaBase = env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in/media";
     return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env);
   } catch (e) {
     return json({ error: e?.message || "Could not create upload URL" }, 500, env);

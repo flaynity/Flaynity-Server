@@ -1,20 +1,17 @@
 [
   {
     "AllowedOrigins": [
-      "*"
+      "https://flaynity.indevs.in",
+      "null"
     ],
     "AllowedMethods": [
-      "GET",
-      "HEAD",
       "PUT"
     ],
     "AllowedHeaders": [
-      "*"
+      "Content-Type"
     ],
     "ExposeHeaders": [
-      "ETag",
-      "Content-Length",
-      "Content-Range"
+      "ETag"
     ],
     "MaxAgeSeconds": 3600
   }

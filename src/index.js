@@ -200,6 +200,16 @@ async function streamApiFetch(env, path, options = {}) {
   return { response, body };
 }
 
+function handleStreamCapability(env) {
+  return json({
+    enabled: !!String(env.CLOUDFLARE_STREAM_API_TOKEN || '').trim(),
+    provider: 'cloudflare-stream',
+    preferredQualityLadder: [144, 360, 480, 720, 1080],
+    advertisedMinimum: 360,
+    note: '144p is only used if Stream exposes a 144p rendition; otherwise the player starts at the closest available level (normally 360p).'
+  }, 200, env);
+}
+
 async function handleStreamUploadUrl(request, env) {
   const authResult = await streamAuth(request, env);
   if (authResult.error) return unauthorized(env, authResult.error.message || "Unauthorized");
@@ -344,6 +354,7 @@ export default {
 
     if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", time: Date.now() }, 200, env);
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
+    if (url.pathname === "/api/v1/stream/capability" && request.method === "GET") return handleStreamCapability(env);
     if (url.pathname === "/api/v1/stream/upload-url" && request.method === "POST") return handleStreamUploadUrl(request, env);
     if (url.pathname === "/api/v1/stream/tus-url" && request.method === "POST") return handleStreamTusUrl(request, env);
     if (url.pathname.startsWith("/api/v1/stream/status/") && request.method === "GET") return handleStreamStatus(request, env, url.pathname.slice("/api/v1/stream/status/".length));

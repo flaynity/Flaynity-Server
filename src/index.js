@@ -300,6 +300,40 @@ async function handleStreamStatus(request, env, uid) {
   } catch (e) { return json({ error: e.message || "Could not read Stream status" }, 503, env); }
 }
 
+async function handleDirectImageUpload(request, env) {
+  try {
+    await verifyFirebaseToken(request, env);
+  } catch (e) {
+    return unauthorized(env, e.message || "Unauthorized");
+  }
+
+  const contentType = String(request.headers.get("Content-Type") || "image/jpeg").split(";")[0].trim().toLowerCase();
+  if (!/^image\/(jpeg|jpg|png|webp|gif|avif|heic|heif)$/.test(contentType)) {
+    return json({ error: "Unsupported image type" }, 400, env);
+  }
+
+  const rawKey = String(request.headers.get("X-Flaynity-Key") || "");
+  const key = sanitizeKey(rawKey);
+  if (!key || !/^uploads\/images\/[a-zA-Z0-9._\/-]+$/.test(key) || key.includes("..")) {
+    return json({ error: "Invalid image key" }, 400, env);
+  }
+
+  const maxBytes = 15 * 1024 * 1024;
+  const length = Number(request.headers.get("Content-Length") || 0);
+  if (length > maxBytes) return json({ error: "Image is too large (max 15 MB)." }, 413, env);
+
+  try {
+    await env.MEDIA_BUCKET.put(key, request.body, {
+      httpMetadata: { contentType }
+    });
+    const mediaBase = env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in";
+    const publicUrl = `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`;
+    return json({ ok: true, key, publicUrl }, 200, env);
+  } catch (e) {
+    return json({ error: e?.message || "Could not upload image" }, 500, env);
+  }
+}
+
 async function handleUploadUrl(request, env) {
   try {
     await verifyFirebaseToken(request, env);
@@ -355,6 +389,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
 
     if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", time: Date.now() }, 200, env);
+    if (url.pathname === "/api/v1/media/upload" && request.method === "POST") return handleDirectImageUpload(request, env);
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
     if (url.pathname === "/api/v1/stream/capability" && request.method === "GET") return handleStreamCapability(env);
     if (url.pathname === "/api/v1/stream/upload-url" && request.method === "POST") return handleStreamUploadUrl(request, env);

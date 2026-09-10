@@ -1,7 +1,7 @@
 [
   {
     "AllowedOrigins": [
-      "https://flaynity.indevs.in"
+      "*"
     ],
     "AllowedMethods": [
       "GET",
@@ -9,8 +9,7 @@
       "PUT"
     ],
     "AllowedHeaders": [
-      "Content-Type",
-      "Authorization"
+      "*"
     ],
     "ExposeHeaders": [
       "ETag",

@@ -278,6 +278,7 @@ async function handleStreamStatus(request, env, uid) {
       uid: v.uid,
       readyToStream: !!v.readyToStream,
       readyToStreamAt: v.readyToStreamAt || null,
+      pctComplete: v.pctComplete == null ? null : Number(v.pctComplete),
       status: v.status || null,
       hls: v.playback?.hls || v.hls || null,
       dash: v.playback?.dash || v.dash || null,

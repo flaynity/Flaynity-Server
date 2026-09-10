@@ -316,7 +316,9 @@ async function handleUploadUrl(request, env) {
 
   try {
     const uploadUrl = await createPresignedPut(env, key, contentType);
-    const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`;
+    // Prefer the direct R2 Custom Domain in production. The Worker /media proxy
+    // remains available for backward compatibility with older stored URLs.
+    const mediaBase = env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in";
     return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env);
   } catch (e) {
     return json({ error: e?.message || "Could not create upload URL" }, 500, env);

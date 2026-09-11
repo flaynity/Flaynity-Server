@@ -74,7 +74,10 @@ async function probeVideoDimensions(file) {
 function fitDimensions(srcW,srcH,maxW,maxH){const scale=Math.min(maxW/srcW,maxH/srcH,1);return{width:Math.max(2,Math.round(srcW*scale/2)*2),height:Math.max(2,Math.round(srcH*scale/2)*2)};}
 async function uploadDirectory(dir,prefix){
   const names=(await fs.readdir(dir)).filter(name=>name.endsWith('.m3u8')||name.endsWith('.ts'));
-  const concurrency=4; let cursor=0;
+  // R2 uploads are independent objects, so use more parallelism here. This is
+  // especially important for the first 144p rendition: publish it as soon as
+  // its segments are in R2 instead of serially uploading each segment.
+  const concurrency=8; let cursor=0;
   async function worker(){while(true){const i=cursor++;if(i>=names.length)return;const name=names[i];const ext=path.extname(name).toLowerCase();await putFile(path.join(dir,name),`${prefix}/${name}`,ext==='.m3u8'?'application/vnd.apple.mpegurl':'video/mp2t');}}
   await Promise.all(Array.from({length:Math.min(concurrency,names.length)},worker));
 }
@@ -101,7 +104,11 @@ async function transcode(job){
       const base=LADDER[i],dims=fitDimensions(sourceSize.width,sourceSize.height,base.width,base.height),q={...base,width:dims.width,height:dims.height};
       job.qualityIndex=i; job.message=`Encoding ${q.name}${audio?' + audio':''} (${i+1}/${LADDER.length})`; job.progress=12+Math.round((i/LADDER.length)*65);
       const dir=path.join(hlsRoot,q.name); await fs.mkdir(dir);
-      const args=['-y','-hide_banner','-loglevel','error','-i',input,'-map','0:v:0',...(audio?['-map','0:a:0?']:[]),'-vf',`scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`,'-c:v','libx264','-preset','superfast','-threads','1','-profile:v',q.profile,'-pix_fmt','yuv420p','-b:v',q.v,'-maxrate',q.max,'-bufsize',q.buf,'-g','120','-keyint_min','120','-force_key_frames','expr:gte(t,n_forced*2)','-sc_threshold','0'];
+      // The first playable rendition is optimized for time-to-first-playback.
+      // Higher renditions keep the normal quality-oriented encoder settings.
+      const preset = i === 0 ? 'ultrafast' : 'superfast';
+      const threads = i === 0 ? '2' : '1';
+      const args=['-y','-hide_banner','-loglevel','error','-i',input,'-map','0:v:0',...(audio?['-map','0:a:0?']:[]),'-vf',`scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`,'-c:v','libx264','-preset',preset,'-threads',threads,'-profile:v',q.profile,'-pix_fmt','yuv420p','-b:v',q.v,'-maxrate',q.max,'-bufsize',q.buf,'-g','120','-keyint_min','120','-force_key_frames','expr:gte(t,n_forced*2)','-sc_threshold','0'];
       if(audio)args.push('-c:a','aac','-b:a',q.a,'-ar','48000','-ac','2');
       args.push('-f','hls','-hls_time','2','-hls_playlist_type','vod','-hls_list_size','0','-hls_flags','independent_segments','-hls_segment_filename',path.join(dir,'seg_%05d.ts'),path.join(dir,'index.m3u8'));
       await run('ffmpeg',args,work,job); variants.push(q);

@@ -5,35 +5,28 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
-import { createWriteStream, createReadStream } from 'node:fs';
+import { createWriteStream } from 'node:fs';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
 const app = express();
 app.use(express.json({ limit: '64kb' }));
-
 const PORT = Number(process.env.PORT || 8080);
 const SECRET = String(process.env.TRANSCODER_SECRET || '');
 const BUCKET = process.env.MEDIA_BUCKET_NAME || 'flaynity-storage';
 const ACCOUNT_ID = process.env.R2_ACCOUNT_ID || '';
-const PUBLIC_BASE = String(
-  process.env.MEDIA_BASE_URL || 'https://cdn.flaynity.indevs.in/media'
-).replace(/\/+$/, '');
+const PUBLIC_BASE = String(process.env.MEDIA_BASE_URL || 'https://cdn.flaynity.indevs.in/media').replace(/\/+$/, '');
 
-/*
- * IMPORTANT:
- * Render Free has very little RAM. Do NOT run five FFmpeg encoders at once.
- * Jobs are queued and only one FFmpeg process is allowed to run at a time.
- */
+// Render Free has very little RAM. Keep only one FFmpeg job active at a time.
 const jobs = new Map();
-let activeJob = null;
 const queue = [];
+let activeJob = null;
 
 const LADDER = [
-  { name: '144p', height: 144, width: 256, videoBitrate: '180k', maxrate: '220k', bufsize: '360k', audio: '48k', bandwidth: 260000 },
-  { name: '360p', height: 360, width: 640, videoBitrate: '650k', maxrate: '800k', bufsize: '1300k', audio: '64k', bandwidth: 800000 },
-  { name: '480p', height: 480, width: 854, videoBitrate: '1100k', maxrate: '1350k', bufsize: '2200k', audio: '96k', bandwidth: 1250000 },
-  { name: '720p', height: 720, width: 1280, videoBitrate: '2500k', maxrate: '3000k', bufsize: '5000k', audio: '128k', bandwidth: 2800000 },
-  { name: '1080p', height: 1080, width: 1920, videoBitrate: '5000k', maxrate: '6000k', bufsize: '10000k', audio: '128k', bandwidth: 5200000 }
+  { name: '144p', width: 256, height: 144, v: '180k', max: '220k', buf: '360k', a: '48k', profile: 'main', bandwidth: 260000 },
+  { name: '360p', width: 640, height: 360, v: '650k', max: '800k', buf: '1300k', a: '64k', profile: 'main', bandwidth: 760000 },
+  { name: '480p', width: 854, height: 480, v: '1100k', max: '1350k', buf: '2200k', a: '96k', profile: 'main', bandwidth: 1250000 },
+  { name: '720p', width: 1280, height: 720, v: '2500k', max: '3000k', buf: '5000k', a: '128k', profile: 'high', bandwidth: 2800000 },
+  { name: '1080p', width: 1920, height: 1080, v: '5000k', max: '6000k', buf: '10000k', a: '128k', profile: 'high', bandwidth: 5400000 }
 ];
 
 const s3 = new S3Client({
@@ -57,53 +50,26 @@ function safeKey(v) {
   return /^uploads\/(feels|videos)\/[a-zA-Z0-9._\/-]+$/.test(s) && !s.includes('..') ? s : null;
 }
 
-function run(cmd, args, cwd) {
+function run(cmd, args, cwd, job) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, {
+    const p = spawn(cmd, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env }
+      env: { ...process.env, FFREPORT: 'level=error' }
     });
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', d => {
-      stdout += d.toString();
-      if (stdout.length > 6000) stdout = stdout.slice(-6000);
+    let out = '';
+    let err = '';
+    p.stdout.on('data', d => { out += d.toString(); if (out.length > 4000) out = out.slice(-4000); });
+    p.stderr.on('data', d => {
+      err += d.toString();
+      if (err.length > 12000) err = err.slice(-12000);
+      // FFmpeg progress can be very noisy; expose only coarse progress.
+      if (job && /frame=|time=/.test(d.toString())) job.progress = Math.max(job.progress || 0, Math.min(80, (job.qualityIndex || 0) * 14 + 18));
     });
-
-    child.stderr.on('data', d => {
-      stderr += d.toString();
-      if (stderr.length > 12000) stderr = stderr.slice(-12000);
-    });
-
-    child.on('error', reject);
-
-    child.on('close', code => {
-      if (code === 0) return resolve({ stdout, stderr });
-      reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-3500)}`));
-    });
-  });
-}
-
-function runProbe(args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn('ffprobe', args, {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', d => stdout += d.toString());
-    child.stderr.on('data', d => stderr += d.toString());
-    child.on('error', reject);
-
-    child.on('close', code => {
-      if (code === 0) return resolve(stdout.trim());
-      reject(new Error(`ffprobe failed: ${stderr.slice(-1500)}`));
-    });
+    p.on('error', reject);
+    p.on('close', code => code === 0
+      ? resolve({ out, err })
+      : reject(new Error(`ffmpeg exited ${code}: ${err.slice(-3000)}`)));
   });
 }
 
@@ -111,13 +77,9 @@ function publicUrl(key) {
   return `${PUBLIC_BASE}/${key.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-/*
- * Stream the local segment/file directly into R2 instead of fs.readFile().
- * This prevents a large segment from being copied into Node's heap.
- */
 async function putFile(file, key, type) {
-  const body = createReadStream(file);
-
+  // A single segment/playlist is read at a time, never the whole HLS directory.
+  const body = await fs.readFile(file);
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
@@ -128,167 +90,100 @@ async function putFile(file, key, type) {
 }
 
 async function hasAudioStream(file) {
-  const out = await runProbe([
-    '-v', 'error',
-    '-select_streams', 'a:0',
-    '-show_entries', 'stream=index',
-    '-of', 'csv=p=0',
-    file
-  ]);
-  return Boolean(out);
+  return await new Promise((resolve, reject) => {
+    const p = spawn('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'a:0',
+      '-show_entries', 'stream=index',
+      '-of', 'csv=p=0',
+      file
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', d => out += d.toString());
+    p.stderr.on('data', d => err += d.toString());
+    p.on('error', reject);
+    p.on('close', code => code === 0
+      ? resolve(Boolean(out.trim()))
+      : reject(new Error(`ffprobe failed: ${err.slice(-1000)}`)));
+  });
 }
 
-async function getVideoHeight(file) {
-  const out = await runProbe([
-    '-v', 'error',
-    '-select_streams', 'v:0',
-    '-show_entries', 'stream=height',
-    '-of', 'csv=p=0',
-    file
-  ]);
-  const height = Number(out);
-  return Number.isFinite(height) && height > 0 ? height : 1080;
-}
-
-function selectLadder(sourceHeight) {
-  /*
-   * Never create fake higher-quality variants. This also saves a lot of CPU/RAM
-   * for small phone videos.
-   */
-  return LADDER.filter(level => level.height <= Math.max(144, sourceHeight));
-}
-
-function masterPlaylist(levels, audioEnabled) {
-  const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
-
-  for (const level of levels) {
-    const audioPart = audioEnabled ? `,CODECS="avc1.64000d,mp4a.40.2"` : ',CODECS="avc1.64000d"';
-    lines.push(
-      `#EXT-X-STREAM-INF:BANDWIDTH=${level.bandwidth},AVERAGE-BANDWIDTH=${Math.round(level.bandwidth * 0.82)},RESOLUTION=${level.width}x${level.height}${audioPart}`
-    );
-    lines.push(`v_${level.height}p.m3u8`);
-  }
-
-  lines.push('');
-  return lines.join('\n');
-}
-
-async function uploadDirectory(outDir, job) {
-  const names = (await fs.readdir(outDir))
-    .filter(name => name.endsWith('.m3u8') || name.endsWith('.ts'))
-    .sort();
-
+async function uploadDirectory(dir, prefix) {
+  const names = await fs.readdir(dir);
   for (const name of names) {
+    const full = path.join(dir, name);
+    const stat = await fs.stat(full);
+    if (!stat.isFile()) continue;
     const ext = path.extname(name).toLowerCase();
-    const type = ext === '.m3u8'
-      ? 'application/vnd.apple.mpegurl'
-      : 'video/mp2t';
-
-    await putFile(
-      path.join(outDir, name),
-      `uploads/hls/${job.id}/${name}`,
-      type
-    );
-
-    if (job.progress < 98) {
-      job.progress = Math.min(98, job.progress + Math.max(1, Math.round(4 / Math.max(1, names.length))));
-    }
+    const type = ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
+    await putFile(full, `${prefix}/${name}`, type);
   }
+}
+
+function makeMaster(variants, audio) {
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
+  for (const v of variants) {
+    lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},AVERAGE-BANDWIDTH=${Math.round(v.bandwidth * 0.9)},RESOLUTION=${v.width}x${v.height},CODECS="${audio ? 'avc1.4d401f,mp4a.40.2' : 'avc1.4d401f'}"`);
+    lines.push(`${v.name}/index.m3u8`);
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 async function transcode(job) {
-  /*
-   * One job at a time + one FFmpeg process at a time.
-   * This is the key RAM protection for Render Free.
-   */
   const work = await fs.mkdtemp(path.join(os.tmpdir(), `flaynity-${job.id}-`));
   const input = path.join(work, 'input.mp4');
-  const out = path.join(work, 'hls');
-
-  await fs.mkdir(out, { recursive: true });
+  const hlsRoot = path.join(work, 'hls');
+  await fs.mkdir(hlsRoot);
 
   try {
     job.status = 'processing';
     job.progress = 3;
     job.message = 'Downloading original video';
 
-    const obj = await s3.send(new GetObjectCommand({
-      Bucket: BUCKET,
-      Key: job.sourceKey
-    }));
-
+    const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: job.sourceKey }));
     if (!obj.Body) throw new Error('R2 returned an empty video body');
-
     await pipeline(obj.Body, createWriteStream(input));
 
-    job.progress = 12;
-    job.message = 'Inspecting source';
+    job.progress = 10;
+    const audio = await hasAudioStream(input);
+    job.hasAudio = audio;
+    job.message = audio ? 'Preparing HLS with audio' : 'Preparing HLS (source has no audio)';
 
-    const [audio, sourceHeight] = await Promise.all([
-      hasAudioStream(input),
-      getVideoHeight(input)
-    ]);
+    const variants = [];
 
-    const levels = selectLadder(sourceHeight);
+    // IMPORTANT: encode one rendition at a time. This is the key RAM fix for
+    // Render Free. The final HLS master still exposes all completed qualities.
+    for (let i = 0; i < LADDER.length; i++) {
+      const q = LADDER[i];
+      job.qualityIndex = i;
+      job.message = `Encoding ${q.name}${audio ? ' + audio' : ''} (${i + 1}/${LADDER.length})`;
+      job.progress = 12 + Math.round((i / LADDER.length) * 65);
 
-    if (!levels.length) {
-      throw new Error('Could not determine a usable video quality.');
-    }
-
-    job.qualities = levels.map(x => x.name);
-    job.message = `Preparing ${levels.map(x => x.name).join(', ')} HLS`;
-
-    /*
-     * MEMORY OPTIMIZATION:
-     * Previous implementation used split=5 and encoded five variants in the
-     * same FFmpeg process. That creates a large filter graph and multiple
-     * encoders simultaneously.
-     *
-     * This version encodes ONE quality at a time. It is slower but dramatically
-     * safer on a 512 MB Render instance.
-     */
-    for (let i = 0; i < levels.length; i++) {
-      const level = levels[i];
-      const playlist = path.join(out, `v_${level.height}p.m3u8`);
-      const segmentPattern = path.join(out, `seg_${level.height}p_%05d.ts`);
-
-      job.progress = 15 + Math.round((i / levels.length) * 65);
-      job.message = `Encoding ${level.name}${audio ? ' + audio' : ''} (${i + 1}/${levels.length})`;
+      const dir = path.join(hlsRoot, q.name);
+      await fs.mkdir(dir);
 
       const args = [
-        '-y',
-        '-hide_banner',
-        '-loglevel', 'error',
-        '-threads', '1',
+        '-y', '-hide_banner', '-loglevel', 'error',
         '-i', input,
-
-        '-map', '0:v:0'
-      ];
-
-      if (audio) args.push('-map', '0:a:0');
-
-      args.push(
-        '-vf',
-        `scale=w=${level.width}:h=${level.height}:force_original_aspect_ratio=decrease,pad=${level.width}:${level.height}:(ow-iw)/2:(oh-ih)/2`,
+        '-map', '0:v:0',
+        ...(audio ? ['-map', '0:a:0?'] : []),
+        '-vf', `scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease,pad=${q.width}:${q.height}:(ow-iw)/2:(oh-ih)/2`,
         '-c:v', 'libx264',
         '-preset', 'veryfast',
-        '-profile:v', level.height >= 720 ? 'high' : 'main',
+        '-threads', '1',
+        '-profile:v', q.profile,
         '-pix_fmt', 'yuv420p',
-        '-b:v', level.videoBitrate,
-        '-maxrate', level.maxrate,
-        '-bufsize', level.bufsize,
+        '-b:v', q.v,
+        '-maxrate', q.max,
+        '-bufsize', q.buf,
         '-g', '24',
         '-keyint_min', '24',
         '-sc_threshold', '0'
-      );
+      ];
 
       if (audio) {
-        args.push(
-          '-c:a', 'aac',
-          '-b:a', level.audio,
-          '-ar', '48000',
-          '-ac', '2'
-        );
+        args.push('-c:a', 'aac', '-b:a', q.a, '-ar', '48000', '-ac', '2');
       }
 
       args.push(
@@ -297,34 +192,35 @@ async function transcode(job) {
         '-hls_playlist_type', 'vod',
         '-hls_list_size', '0',
         '-hls_flags', 'independent_segments',
-        '-hls_segment_filename', segmentPattern,
-        playlist
+        '-hls_segment_filename', path.join(dir, 'seg_%05d.ts'),
+        path.join(dir, 'index.m3u8')
       );
 
-      await run('ffmpeg', args, work);
+      await run('ffmpeg', args, work, job);
+      variants.push(q);
 
-      /*
-       * Free FFmpeg resources before starting the next quality.
-       * spawn() exits here, so there is never a 5-encoder memory spike.
-       */
+      // Free FFmpeg's output buffers before starting the next rendition.
+      await new Promise(r => setTimeout(r, 50));
     }
 
-    const master = masterPlaylist(levels, audio);
-    await fs.writeFile(path.join(out, 'master.m3u8'), master, 'utf8');
+    const master = makeMaster(variants, audio);
+    await fs.writeFile(path.join(hlsRoot, 'master.m3u8'), master, 'utf8');
 
     job.progress = 82;
     job.message = 'Publishing HLS to R2';
 
-    await uploadDirectory(out, job);
+    // Upload one file at a time to keep Node memory bounded.
+    for (const q of variants) {
+      await uploadDirectory(path.join(hlsRoot, q.name), `uploads/hls/${job.id}/${q.name}`);
+    }
+    await putFile(path.join(hlsRoot, 'master.m3u8'), `uploads/hls/${job.id}/master.m3u8`, 'application/vnd.apple.mpegurl');
 
     job.status = 'ready';
     job.progress = 100;
-    job.message = audio
-      ? 'Ready with audio'
-      : 'Ready (source had no audio track)';
-
+    job.message = audio ? 'Ready with audio' : 'Ready (source has no audio track)';
     job.hlsUrl = publicUrl(`uploads/hls/${job.id}/master.m3u8`);
     job.hlsKey = `uploads/hls/${job.id}/master.m3u8`;
+    job.videoQualities = variants.map(v => ({ quality: v.name, url: publicUrl(`uploads/hls/${job.id}/${v.name}/index.m3u8`) }));
   } catch (e) {
     job.status = 'failed';
     job.progress = 0;
@@ -334,11 +230,9 @@ async function transcode(job) {
   }
 }
 
-async function processQueue() {
-  if (activeJob || queue.length === 0) return;
-
+async function pumpQueue() {
+  if (activeJob || !queue.length) return;
   activeJob = queue.shift();
-
   try {
     await transcode(activeJob);
   } catch (e) {
@@ -347,90 +241,59 @@ async function processQueue() {
     activeJob.message = e?.message || 'Transcoding failed';
   } finally {
     activeJob = null;
-    setImmediate(processQueue);
+    // Keep a bounded job history so repeated uploads cannot leak memory.
+    const now = Date.now();
+    for (const [id, job] of jobs) {
+      if (job.status !== 'queued' && job.status !== 'processing' && now - job.createdAt > 60 * 60 * 1000) jobs.delete(id);
+    }
+    setImmediate(pumpQueue);
   }
 }
 
-app.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'flaynity-r2-hls-transcoder',
-    activeJob: activeJob?.id || null,
-    queuedJobs: queue.length,
-    memory: {
-      rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-      heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
-    }
-  });
-});
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  service: 'flaynity-r2-hls-transcoder',
+  queue: queue.length,
+  processing: Boolean(activeJob),
+  memory: process.memoryUsage().rss
+}));
 
 app.post('/jobs', auth, (req, res) => {
   const sourceKey = safeKey(req.body?.sourceKey);
   if (!sourceKey) return res.status(400).json({ error: 'Invalid source key' });
 
   const id = crypto.randomUUID();
-
   const job = {
     id,
     sourceKey,
     status: 'queued',
     progress: 0,
-    message: 'Queued',
-    qualities: [],
+    message: 'Queued (one transcode at a time)',
+    createdAt: Date.now(),
     hlsUrl: null,
     hlsKey: null,
-    createdAt: Date.now()
+    hasAudio: null
   };
-
   jobs.set(id, job);
   queue.push(job);
-  processQueue();
+  pumpQueue();
 
-  res.status(202).json({
-    jobId: id,
-    status: job.status,
-    queuePosition: queue.length
-  });
+  res.status(202).json({ jobId: id, status: job.status, message: job.message });
 });
 
 app.get('/jobs/:id', auth, (req, res) => {
   const job = jobs.get(req.params.id);
-
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found' });
-  }
-
+  if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json({
     id: job.id,
     status: job.status,
     progress: job.progress,
     message: job.message,
-    qualities: job.qualities,
     hlsUrl: job.hlsUrl || null,
     hlsKey: job.hlsKey || null,
-    queuePosition: queue.indexOf(job) >= 0 ? queue.indexOf(job) + 1 : 0
+    hasAudio: job.hasAudio,
+    videoQualities: job.videoQualities || []
   });
 });
 
-/*
- * Keep the in-memory job map bounded. Completed jobs older than one hour are
- * removed so long-running services don't grow forever.
- */
-setInterval(() => {
-  const cutoff = Date.now() - 60 * 60 * 1000;
-
-  for (const [id, job] of jobs) {
-    if (
-      job !== activeJob &&
-      job.createdAt < cutoff &&
-      (job.status === 'ready' || job.status === 'failed')
-    ) {
-      jobs.delete(id);
-    }
-  }
-}, 10 * 60 * 1000).unref();
-
-app.listen(PORT, () => {
-  console.log(`Flaynity HLS transcoder listening on ${PORT}`);
-  console.log('Memory-safe mode: one FFmpeg process at a time');
-});
+app.listen(PORT, () => console.log(`Flaynity HLS transcoder listening on ${PORT} (single-job memory-safe mode)`));

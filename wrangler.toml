@@ -15,3 +15,6 @@ FIREBASE_PROJECT_ID = "flaynity-app"
 R2_ACCOUNT_ID = "b3741135bd1f3e96b6744f11e6a06600"
 MEDIA_BUCKET_NAME = "flaynity-storage"
 MEDIA_BASE_URL = "https://cdn.flaynity.indevs.in/media"
+
+# Set TRANSCODER_URL and TRANSCODER_SECRET with `wrangler secret put`.
+# TRANSCODER_URL example: https://your-transcoder.example.com

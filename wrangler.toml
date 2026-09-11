@@ -1,10 +1,9 @@
 name = "flaynity-server"
-main = "src/index.js"
+main = "src/index-fast.js"
 compatibility_date = "2026-09-09"
 workers_dev = true
 
-# IMPORTANT: This is the EXISTING R2 bucket already used by the Flaynity app.
-# Do NOT create another bucket. The Worker is bound to this same bucket.
+# Existing Flaynity R2 bucket.
 [[r2_buckets]]
 binding = "MEDIA_BUCKET"
 bucket_name = "flaynity-storage"
@@ -17,4 +16,3 @@ MEDIA_BUCKET_NAME = "flaynity-storage"
 MEDIA_BASE_URL = "https://cdn.flaynity.indevs.in/media"
 
 # Set TRANSCODER_URL and TRANSCODER_SECRET with `wrangler secret put`.
-# TRANSCODER_URL example: https://your-transcoder.example.com

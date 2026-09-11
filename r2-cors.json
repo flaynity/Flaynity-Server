@@ -1,0 +1,19 @@
+[
+  {
+    "AllowedOrigins": [
+      "https://flaynity.indevs.in"
+    ],
+    "AllowedMethods": [
+      "GET",
+      "HEAD",
+      "PUT"
+    ],
+    "AllowedHeaders": [
+      "*"
+    ],
+    "ExposeHeaders": [
+      "ETag"
+    ],
+    "MaxAgeSeconds": 86400
+  }
+]

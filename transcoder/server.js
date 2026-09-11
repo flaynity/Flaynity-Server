@@ -78,7 +78,7 @@ async function uploadDirectory(dir,prefix){
   async function worker(){while(true){const i=cursor++;if(i>=names.length)return;const name=names[i];const ext=path.extname(name).toLowerCase();await putFile(path.join(dir,name),`${prefix}/${name}`,ext==='.m3u8'?'application/vnd.apple.mpegurl':'video/mp2t');}}
   await Promise.all(Array.from({length:Math.min(concurrency,names.length)},worker));
 }
-function makeMaster(variants,audio){const lines=['#EXTM3U','#EXT-X-VERSION:3'];for(const v of variants){lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},AVERAGE-BANDWIDTH=${Math.round(v.bandwidth*.9)},RESOLUTION=${v.width}x${v.height},CODECS="${audio?'avc1.4d401f,mp4a.40.2':'avc1.4d401f'}"`);lines.push(`${v.name}/index.m3u8`);}return `${lines.join('\n')}\n`;}
+function makeMaster(variants,audio){const lines=['#EXTM3U','#EXT-X-VERSION:3'];for(const v of variants){lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},AVERAGE-BANDWIDTH=${Math.round(v.bandwidth*.9)},RESOLUTION=${v.width}x${v.height},CODECS=\"${audio?'avc1.4d401f,mp4a.40.2':'avc1.4d401f'}\"`);lines.push(`${v.name}/index.m3u8`);}return `${lines.join('\n')}\n`;}
 
 async function publishMaster(job,hlsRoot,variants,audio){
   const file=path.join(hlsRoot,'master.m3u8');
@@ -106,19 +106,33 @@ async function transcode(job){
       args.push('-f','hls','-hls_time','1','-hls_playlist_type','vod','-hls_list_size','0','-hls_flags','independent_segments','-hls_segment_filename',path.join(dir,'seg_%05d.ts'),path.join(dir,'index.m3u8'));
       await run('ffmpeg',args,work,job); variants.push(q);
       await uploadDirectory(dir,`uploads/hls/${job.id}/${q.name}`);
-      // Publish 144p as soon as it is uploaded. Higher qualities are added later.
-      // The upload API can therefore finish without waiting for 360/480/720/1080.
       await publishMaster(job,hlsRoot,variants,audio);
       job.message=i===0?'144p ready — higher qualities are processing':`${q.name} ready`;
       job.progress=i===0?28:12+Math.round(((i+1)/LADDER.length)*70);
+      // IMPORTANT: once 144p is published, the upload is considered ready.
+      // FFmpeg continues the remaining qualities in the same background job.
+      // This makes the UI return immediately after the first playable rendition.
+      if (i === 0) {
+        job.status = 'ready';
+        job.initialReady = true;
+        job.progress = 28;
+      }
     }
     job.status='ready'; job.progress=100; job.message=audio?'Ready with adaptive HLS':'Ready (source has no audio track)';
-  }catch(e){job.status='failed';job.progress=0;job.message=e?.message||'Transcoding failed';}
-  finally{await fs.rm(work,{recursive:true,force:true}).catch(()=>{});}
+  }catch(e){
+    // If 144p was already published, keep the job playable even when a later
+    // high-quality rendition fails. The available ladder remains usable.
+    if (job.initialReady && job.hlsUrl) {
+      job.status='ready';
+      job.message='144p ready; some higher qualities failed to process';
+    } else {
+      job.status='failed'; job.progress=0; job.message=e?.message||'Transcoding failed';
+    }
+  }finally{await fs.rm(work,{recursive:true,force:true}).catch(()=>{});}
 }
-async function pumpQueue(){if(activeJob||!queue.length)return;activeJob=queue.shift();try{await transcode(activeJob);}catch(e){activeJob.status='failed';activeJob.progress=0;activeJob.message=e?.message||'Transcoding failed';}finally{activeJob=null;const now=Date.now();for(const[id,job]of jobs){if(job.status!=='queued'&&job.status!=='processing'&&now-job.createdAt>60*60*1000)jobs.delete(id);}setImmediate(pumpQueue);}}
+async function pumpQueue(){if(activeJob||!queue.length)return;activeJob=queue.shift();try{await transcode(activeJob);}catch(e){if(activeJob.initialReady&&activeJob.hlsUrl){activeJob.status='ready';activeJob.message='144p ready; background processing incomplete';}else{activeJob.status='failed';activeJob.progress=0;activeJob.message=e?.message||'Transcoding failed';}}finally{activeJob=null;const now=Date.now();for(const[id,job]of jobs){if(job.status!=='queued'&&job.status!=='processing'&&now-job.createdAt>60*60*1000)jobs.delete(id);}setImmediate(pumpQueue);}}
 
 app.get('/health',(_req,res)=>res.json({ok:true,service:'flaynity-r2-hls-transcoder',queue:queue.length,processing:Boolean(activeJob),memory:process.memoryUsage().rss}));
-app.post('/jobs',auth,(req,res)=>{const sourceKey=safeKey(req.body?.sourceKey);if(!sourceKey)return res.status(400).json({error:'Invalid source key'});const id=crypto.randomUUID();const job={id,sourceKey,status:'queued',progress:0,message:'Queued (fast 144p first, then adaptive qualities)',createdAt:Date.now(),hlsUrl:null,hlsKey:null,hasAudio:null,videoQualities:[]};jobs.set(id,job);queue.push(job);pumpQueue();res.status(202).json({jobId:id,status:job.status,message:job.message});});
+app.post('/jobs',auth,(req,res)=>{const sourceKey=safeKey(req.body?.sourceKey);if(!sourceKey)return res.status(400).json({error:'Invalid source key'});const id=crypto.randomUUID();const job={id,sourceKey,status:'queued',progress:0,message:'Queued (fast 144p first, then adaptive qualities)',createdAt:Date.now(),hlsUrl:null,hlsKey:null,hasAudio:null,videoQualities:[],initialReady:false};jobs.set(id,job);queue.push(job);pumpQueue();res.status(202).json({jobId:id,status:job.status,message:job.message});});
 app.get('/jobs/:id',auth,(req,res)=>{const job=jobs.get(req.params.id);if(!job)return res.status(404).json({error:'Job not found'});res.json({id:job.id,status:job.status,progress:job.progress,message:job.message,hlsUrl:job.hlsUrl||null,hlsKey:job.hlsKey||null,hasAudio:job.hasAudio,videoQualities:job.videoQualities||[]});});
 app.listen(PORT,()=>console.log(`Flaynity HLS transcoder listening on ${PORT} (144p-first adaptive mode)`));

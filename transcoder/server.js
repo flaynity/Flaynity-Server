@@ -101,9 +101,9 @@ async function transcode(job){
       const base=LADDER[i],dims=fitDimensions(sourceSize.width,sourceSize.height,base.width,base.height),q={...base,width:dims.width,height:dims.height};
       job.qualityIndex=i; job.message=`Encoding ${q.name}${audio?' + audio':''} (${i+1}/${LADDER.length})`; job.progress=12+Math.round((i/LADDER.length)*65);
       const dir=path.join(hlsRoot,q.name); await fs.mkdir(dir);
-      const args=['-y','-hide_banner','-loglevel','error','-i',input,'-map','0:v:0',...(audio?['-map','0:a:0?']:[]),'-vf',`scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`,'-c:v','libx264','-preset','superfast','-threads','1','-profile:v',q.profile,'-pix_fmt','yuv420p','-b:v',q.v,'-maxrate',q.max,'-bufsize',q.buf,'-g','24','-keyint_min','24','-sc_threshold','0'];
+      const args=['-y','-hide_banner','-loglevel','error','-i',input,'-map','0:v:0',...(audio?['-map','0:a:0?']:[]),'-vf',`scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`,'-c:v','libx264','-preset','superfast','-threads','1','-profile:v',q.profile,'-pix_fmt','yuv420p','-b:v',q.v,'-maxrate',q.max,'-bufsize',q.buf,'-g','120','-keyint_min','120','-force_key_frames','expr:gte(t,n_forced*2)','-sc_threshold','0'];
       if(audio)args.push('-c:a','aac','-b:a',q.a,'-ar','48000','-ac','2');
-      args.push('-f','hls','-hls_time','1','-hls_playlist_type','vod','-hls_list_size','0','-hls_flags','independent_segments','-hls_segment_filename',path.join(dir,'seg_%05d.ts'),path.join(dir,'index.m3u8'));
+      args.push('-f','hls','-hls_time','2','-hls_playlist_type','vod','-hls_list_size','0','-hls_flags','independent_segments','-hls_segment_filename',path.join(dir,'seg_%05d.ts'),path.join(dir,'index.m3u8'));
       await run('ffmpeg',args,work,job); variants.push(q);
       await uploadDirectory(dir,`uploads/hls/${job.id}/${q.name}`);
       await publishMaster(job,hlsRoot,variants,audio);
@@ -135,4 +135,4 @@ async function pumpQueue(){if(activeJob||!queue.length)return;activeJob=queue.sh
 app.get('/health',(_req,res)=>res.json({ok:true,service:'flaynity-r2-hls-transcoder',queue:queue.length,processing:Boolean(activeJob),memory:process.memoryUsage().rss}));
 app.post('/jobs',auth,(req,res)=>{const sourceKey=safeKey(req.body?.sourceKey);if(!sourceKey)return res.status(400).json({error:'Invalid source key'});const id=crypto.randomUUID();const job={id,sourceKey,status:'queued',progress:0,message:'Queued (fast 144p first, then adaptive qualities)',createdAt:Date.now(),hlsUrl:null,hlsKey:null,hasAudio:null,videoQualities:[],initialReady:false};jobs.set(id,job);queue.push(job);pumpQueue();res.status(202).json({jobId:id,status:job.status,message:job.message});});
 app.get('/jobs/:id',auth,(req,res)=>{const job=jobs.get(req.params.id);if(!job)return res.status(404).json({error:'Job not found'});res.json({id:job.id,status:job.status,progress:job.progress,message:job.message,hlsUrl:job.hlsUrl||null,hlsKey:job.hlsKey||null,hasAudio:job.hasAudio,videoQualities:job.videoQualities||[]});});
-app.listen(PORT,()=>console.log(`Flaynity HLS transcoder listening on ${PORT} (144p-first adaptive mode)`));
+app.listen(PORT,()=>console.log(`Flaynity HLS transcoder listening on ${PORT} (144p-first adaptive mode, 2s HLS segments)`));

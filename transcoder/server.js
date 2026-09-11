@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, createReadStream } from 'node:fs';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
 const app = express();
@@ -79,7 +79,7 @@ function publicUrl(key) {
 
 async function putFile(file, key, type) {
   // A single segment/playlist is read at a time, never the whole HLS directory.
-  const body = await fs.readFile(file);
+  const body = createReadStream(file);
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
@@ -109,16 +109,52 @@ async function hasAudioStream(file) {
   });
 }
 
+async function probeVideoDimensions(file) {
+  return await new Promise((resolve, reject) => {
+    const p = spawn('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height',
+      '-of', 'csv=p=0:s=x',
+      file
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', d => out += d.toString());
+    p.stderr.on('data', d => err += d.toString());
+    p.on('error', reject);
+    p.on('close', code => {
+      if (code !== 0) return reject(new Error(`ffprobe video dimensions failed: ${err.slice(-1000)}`));
+      const m = out.trim().match(/^(\d+)x(\d+)$/);
+      if (!m) return reject(new Error('Could not detect original video dimensions.'));
+      resolve({ width: Number(m[1]), height: Number(m[2]) });
+    });
+  });
+}
+
+function fitDimensions(srcW, srcH, maxW, maxH) {
+  const scale = Math.min(maxW / srcW, maxH / srcH, 1);
+  let width = Math.max(2, Math.round(srcW * scale / 2) * 2);
+  let height = Math.max(2, Math.round(srcH * scale / 2) * 2);
+  return { width, height };
+}
+
 async function uploadDirectory(dir, prefix) {
-  const names = await fs.readdir(dir);
-  for (const name of names) {
-    const full = path.join(dir, name);
-    const stat = await fs.stat(full);
-    if (!stat.isFile()) continue;
-    const ext = path.extname(name).toLowerCase();
-    const type = ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
-    await putFile(full, `${prefix}/${name}`, type);
+  const names = (await fs.readdir(dir)).filter(name => name.endsWith('.m3u8') || name.endsWith('.ts'));
+  const concurrency = 4;
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= names.length) return;
+      const name = names[i];
+      const full = path.join(dir, name);
+      const ext = path.extname(name).toLowerCase();
+      const type = ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
+      await putFile(full, `${prefix}/${name}`, type);
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(concurrency, names.length) }, worker));
 }
 
 function makeMaster(variants, audio) {
@@ -147,7 +183,10 @@ async function transcode(job) {
 
     job.progress = 10;
     const audio = await hasAudioStream(input);
+    const sourceSize = await probeVideoDimensions(input);
     job.hasAudio = audio;
+    job.sourceWidth = sourceSize.width;
+    job.sourceHeight = sourceSize.height;
     job.message = audio ? 'Preparing HLS with audio' : 'Preparing HLS (source has no audio)';
 
     const variants = [];
@@ -155,7 +194,9 @@ async function transcode(job) {
     // IMPORTANT: encode one rendition at a time. This is the key RAM fix for
     // Render Free. The final HLS master still exposes all completed qualities.
     for (let i = 0; i < LADDER.length; i++) {
-      const q = LADDER[i];
+      const base = LADDER[i];
+      const dims = fitDimensions(sourceSize.width, sourceSize.height, base.width, base.height);
+      const q = { ...base, width: dims.width, height: dims.height };
       job.qualityIndex = i;
       job.message = `Encoding ${q.name}${audio ? ' + audio' : ''} (${i + 1}/${LADDER.length})`;
       job.progress = 12 + Math.round((i / LADDER.length) * 65);
@@ -168,9 +209,9 @@ async function transcode(job) {
         '-i', input,
         '-map', '0:v:0',
         ...(audio ? ['-map', '0:a:0?'] : []),
-        '-vf', `scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease,pad=${q.width}:${q.height}:(ow-iw)/2:(oh-ih)/2`,
+        '-vf', `scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`,
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
+        '-preset', 'superfast',
         '-threads', '1',
         '-profile:v', q.profile,
         '-pix_fmt', 'yuv420p',
@@ -268,7 +309,7 @@ app.post('/jobs', auth, (req, res) => {
     sourceKey,
     status: 'queued',
     progress: 0,
-    message: 'Queued (one transcode at a time)',
+    message: 'Queued (memory-safe single transcode)' ,
     createdAt: Date.now(),
     hlsUrl: null,
     hlsKey: null,

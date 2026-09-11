@@ -93,7 +93,7 @@ async function transcode(job) {
       if (audio) args.push('-map','0:a:0');
       args.push('-c:v:'+i,'libx264','-preset','veryfast','-profile:v:'+i,m[5],'-pix_fmt:v:'+i,'yuv420p',
         '-b:v:'+i,m[1],'-maxrate:v:'+i,m[2],'-bufsize:v:'+i,m[3],
-        '-g:v:'+i,'48','-keyint_min:v:'+i,'48','-sc_threshold:v:'+i,'0');
+        '-g:v:'+i,'24','-keyint_min:v:'+i,'24','-sc_threshold:v:'+i,'0');
       if (audio) args.push('-c:a:'+i,'aac','-b:a:'+i,m[4],'-ar:'+i,'48000','-ac:'+i,'2');
     });
 
@@ -104,7 +104,7 @@ async function transcode(job) {
     args.push('-var_stream_map',map,
       '-master_pl_name','master.m3u8',
       '-f','hls',
-      '-hls_time','2',
+      '-hls_time','1',
       '-hls_playlist_type','vod',
       '-hls_list_size','0',
       '-hls_flags','independent_segments',

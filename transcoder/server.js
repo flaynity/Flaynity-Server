@@ -47,6 +47,17 @@ async function putFile(file, key, type) {
   await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: body, ContentType: type, CacheControl: 'public, max-age=31536000, immutable' }));
 }
 
+async function hasAudioStream(file) {
+  return await new Promise((resolve, reject) => {
+    const p = spawn('ffprobe', ['-v','error','-select_streams','a:0','-show_entries','stream=index','-of','csv=p=0',file], { stdio:['ignore','pipe','pipe'] });
+    let out=''; let err='';
+    p.stdout.on('data', d => out += d.toString());
+    p.stderr.on('data', d => err += d.toString());
+    p.on('error', reject);
+    p.on('close', code => code === 0 ? resolve(Boolean(out.trim())) : reject(new Error(`ffprobe failed: ${err.slice(-1000)}`)));
+  });
+}
+
 async function transcode(job) {
   const work = await fs.mkdtemp(path.join(os.tmpdir(), `flaynity-${job.id}-`));
   const input = path.join(work, 'input.mp4');
@@ -57,32 +68,60 @@ async function transcode(job) {
     const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: job.sourceKey }));
     if (!obj.Body) throw new Error('R2 returned an empty video body');
     await pipeline(obj.Body, createWriteStream(input));
-    job.progress=15; job.message='Encoding adaptive HLS';
+    job.progress=15; job.message='Preparing adaptive HLS';
 
-    // Five rendition ladder. FFmpeg will downscale automatically when the source is smaller.
+    const audio = await hasAudioStream(input);
+    // Ascending ladder is intentional: level 0 is always the lowest quality,
+    // allowing the player to start tiny and hand control to ABR after startup.
     const filter = '[0:v]split=5[v0][v1][v2][v3][v4];' +
       '[v0]scale=w=256:h=144:force_original_aspect_ratio=decrease,pad=256:144:(ow-iw)/2:(oh-ih)/2[v144];' +
       '[v1]scale=w=640:h=360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2[v360];' +
       '[v2]scale=w=854:h=480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2[v480];' +
       '[v3]scale=w=1280:h=720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2[v720];' +
       '[v4]scale=w=1920:h=1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2[v1080]';
-    const args = ['-y','-i',input,'-filter_complex',filter,
-      '-map','[v144]','-map','0:a:0?','-c:v:0','libx264','-preset','veryfast','-profile:v:0','main','-b:v:0','180k','-maxrate:v:0','220k','-bufsize:v:0','360k','-g','48','-keyint_min','48','-sc_threshold','0','-c:a:0','aac','-b:a:0','48k','-ac:0','2',
-      '-map','[v360]','-map','0:a:0?','-c:v:1','libx264','-preset','veryfast','-profile:v:1','main','-b:v:1','650k','-maxrate:v:1','800k','-bufsize:v:1','1300k','-c:a:1','aac','-b:a:1','64k','-ac:1','2',
-      '-map','[v480]','-map','0:a:0?','-c:v:2','libx264','-preset','veryfast','-profile:v:2','main','-b:v:2','1100k','-maxrate:v:2','1350k','-bufsize:v:2','2200k','-c:a:2','aac','-b:a:2','96k','-ac:2','2',
-      '-map','[v720]','-map','0:a:0?','-c:v:3','libx264','-preset','veryfast','-profile:v:3','high','-b:v:3','2500k','-maxrate:v:3','3000k','-bufsize:v:3','5000k','-c:a:3','aac','-b:a:3','128k','-ac:3','2',
-      '-map','[v1080]','-map','0:a:0?','-c:v:4','libx264','-preset','veryfast','-profile:v:4','high','-b:v:4','5000k','-maxrate:v:4','6000k','-bufsize:v:4','10000k','-c:a:4','aac','-b:a:4','128k','-ac:4','2',
-      '-var_stream_map','v:0,a:0,name:144p v:1,a:1,name:360p v:2,a:2,name:480p v:3,a:3,name:720p v:4,a:4,name:1080p',
-      '-master_pl_name','master.m3u8','-f','hls','-hls_time','4','-hls_playlist_type','vod','-hls_segment_type','fmp4','-hls_fmp4_init_filename','init_%v.mp4','-hls_segment_filename',path.join(out,'seg_%v_%05d.m4s'),path.join(out,'v_%v.m3u8')];
+
+    const args = ['-y','-i',input,'-filter_complex',filter];
+    const videoMaps = [
+      ['[v144]','180k','220k','360k','48k','main'],
+      ['[v360]','650k','800k','1300k','64k','main'],
+      ['[v480]','1100k','1350k','2200k','96k','main'],
+      ['[v720]','2500k','3000k','5000k','128k','high'],
+      ['[v1080]','5000k','6000k','10000k','128k','high']
+    ];
+    videoMaps.forEach((m,i) => {
+      args.push('-map',m[0]);
+      if (audio) args.push('-map','0:a:0');
+      args.push('-c:v:'+i,'libx264','-preset','veryfast','-profile:v:'+i,m[5],'-pix_fmt:v:'+i,'yuv420p',
+        '-b:v:'+i,m[1],'-maxrate:v:'+i,m[2],'-bufsize:v:'+i,m[3],
+        '-g:v:'+i,'48','-keyint_min:v:'+i,'48','-sc_threshold:v:'+i,'0');
+      if (audio) args.push('-c:a:'+i,'aac','-b:a:'+i,m[4],'-ar:'+i,'48000','-ac:'+i,'2');
+    });
+
+    const map = audio
+      ? 'v:0,a:0,name:144p v:1,a:1,name:360p v:2,a:2,name:480p v:3,a:3,name:720p v:4,a:4,name:1080p'
+      : 'v:0,name:144p v:1,name:360p v:2,name:480p v:3,name:720p v:4,name:1080p';
+
+    args.push('-var_stream_map',map,
+      '-master_pl_name','master.m3u8',
+      '-f','hls',
+      '-hls_time','2',
+      '-hls_playlist_type','vod',
+      '-hls_list_size','0',
+      '-hls_flags','independent_segments',
+      '-hls_segment_filename',path.join(out,'seg_%v_%05d.ts'),
+      path.join(out,'v_%v.m3u8'));
+
+    job.message = audio ? 'Encoding video + AAC audio' : 'Encoding video (no audio track found)';
     await run('ffmpeg', args, work);
     job.progress=85; job.message='Publishing HLS segments to R2';
     const files = await fs.readdir(out);
     for (const name of files) {
       const ext = path.extname(name).toLowerCase();
-      const type = ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp4';
+      const type = ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
       await putFile(path.join(out,name), `uploads/hls/${job.id}/${name}`, type);
     }
-    job.status='ready'; job.progress=100; job.message='Ready'; job.hlsUrl=publicUrl(`uploads/hls/${job.id}/master.m3u8`);
+    job.status='ready'; job.progress=100; job.message=audio ? 'Ready with audio' : 'Ready (source had no audio)';
+    job.hlsUrl=publicUrl(`uploads/hls/${job.id}/master.m3u8`);
   } catch (e) {
     job.status='failed'; job.progress=0; job.message=e.message || 'Transcoding failed';
   } finally {

@@ -77,17 +77,15 @@ function publicUrl(key) {
   return `${PUBLIC_BASE}/${key.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-async function putFile(file, key, type) {
-  // Playlists must revalidate while a job is still building. Segments are
-  // immutable and can stay cached for a year.
-  const isPlaylist = type === 'application/vnd.apple.mpegurl';
+async function putFile(file, key, type, cacheControl = 'public, max-age=31536000, immutable') {
+  // A single segment/playlist is read at a time, never the whole HLS directory.
   const body = createReadStream(file);
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
     Body: body,
     ContentType: type,
-    CacheControl: isPlaylist ? 'public, max-age=0, must-revalidate' : 'public, max-age=31536000, immutable'
+    CacheControl: cacheControl
   }));
 }
 
@@ -193,15 +191,15 @@ async function transcode(job) {
 
     const variants = [];
 
-    // IMPORTANT: encode one rendition at a time. This is the key RAM fix for
-    // Render Free. The final HLS master still exposes all completed qualities.
+    // Render 144p first. This is the only rendition required before the post can
+    // be published. The remaining ladder continues in this same worker process.
     for (let i = 0; i < LADDER.length; i++) {
       const base = LADDER[i];
       const dims = fitDimensions(sourceSize.width, sourceSize.height, base.width, base.height);
       const q = { ...base, width: dims.width, height: dims.height };
       job.qualityIndex = i;
       job.message = `Encoding ${q.name}${audio ? ' + audio' : ''} (${i + 1}/${LADDER.length})`;
-      job.progress = 12 + Math.round((i / LADDER.length) * 65);
+      job.progress = i === 0 ? 12 : 35 + Math.round(((i - 1) / Math.max(1, LADDER.length - 2)) * 55);
 
       const dir = path.join(hlsRoot, q.name);
       await fs.mkdir(dir);
@@ -213,17 +211,14 @@ async function transcode(job) {
         ...(audio ? ['-map', '0:a:0?'] : []),
         '-vf', `scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`,
         '-c:v', 'libx264',
-        '-preset', 'superfast',
-        '-threads', '1',
+        '-preset', i === 0 ? 'ultrafast' : 'veryfast',
+        '-threads', i === 0 ? '2' : '1',
         '-profile:v', q.profile,
         '-pix_fmt', 'yuv420p',
         '-b:v', q.v,
         '-maxrate', q.max,
         '-bufsize', q.buf,
-        // Force an IDR every 2 seconds so HLS can start on small, aligned
-        // segments and switch qualities cleanly.
-        '-force_key_frames', 'expr:gte(t,n_forced*2)',
-        '-g', '120',
+        '-g', '48',
         '-keyint_min', '48',
         '-sc_threshold', '0'
       ];
@@ -245,33 +240,38 @@ async function transcode(job) {
       await run('ffmpeg', args, work, job);
       variants.push(q);
 
-      // Publish each completed rendition immediately. This is what lets the
-      // app start at 144p instead of waiting for the complete ladder.
-      await uploadDirectory(path.join(hlsRoot, q.name), `uploads/hls/${job.id}/${q.name}`);
+      // Publish the newly completed rendition immediately. For 144p this makes
+      // playback available before any other quality has finished.
+      await uploadDirectory(dir, `uploads/hls/${job.id}/${q.name}`);
+
       const master = makeMaster(variants, audio);
-      await fs.writeFile(path.join(hlsRoot, 'master.m3u8'), master, 'utf8');
-      await putFile(path.join(hlsRoot, 'master.m3u8'), `uploads/hls/${job.id}/master.m3u8`, 'application/vnd.apple.mpegurl');
+      const masterPath = path.join(hlsRoot, 'master.m3u8');
+      await fs.writeFile(masterPath, master, 'utf8');
+      await putFile(masterPath, `uploads/hls/${job.id}/master.m3u8`, 'application/vnd.apple.mpegurl', 'public, max-age=0, must-revalidate');
 
       job.hlsUrl = publicUrl(`uploads/hls/${job.id}/master.m3u8`);
       job.hlsKey = `uploads/hls/${job.id}/master.m3u8`;
+      job.completedQualities = variants.map(v => v.name);
       job.videoQualities = variants.map(v => ({ quality: v.name, url: publicUrl(`uploads/hls/${job.id}/${v.name}/index.m3u8`) }));
-      job.availableQualities = variants.map(v => Number.parseInt(v.name, 10));
-      if (variants.length === 1) {
-        job.status = 'playable';
-        job.message = '144p ready — playback can start while higher qualities render.';
-      } else {
-        job.status = 'processing';
-        job.message = `${q.name} ready — higher qualities continue in background.`;
-      }
-      job.progress = 15 + Math.round((i + 1) / LADDER.length * 70);
 
-      // Free FFmpeg's output buffers before starting the next rendition.
-      await new Promise(r => setTimeout(r, 50));
+      if (i === 0) {
+        job.initialReady = true;
+        job.initialQuality = '144p';
+        job.progress = 30;
+        job.message = '144p ready — published; higher qualities are processing in background';
+      } else if (i < LADDER.length - 1) {
+        job.message = `${q.name} ready — continuing higher qualities in background`;
+      }
     }
 
     job.status = 'ready';
     job.progress = 100;
+    job.initialReady = true;
     job.message = audio ? 'All HLS qualities ready' : 'All HLS qualities ready (source has no audio track)';
+    job.hlsUrl = publicUrl(`uploads/hls/${job.id}/master.m3u8`);
+    job.hlsKey = `uploads/hls/${job.id}/master.m3u8`;
+    job.completedQualities = variants.map(v => v.name);
+    job.videoQualities = variants.map(v => ({ quality: v.name, url: publicUrl(`uploads/hls/${job.id}/${v.name}/index.m3u8`) }));
   } catch (e) {
     job.status = 'failed';
     job.progress = 0;
@@ -323,8 +323,11 @@ app.post('/jobs', auth, (req, res) => {
     createdAt: Date.now(),
     hlsUrl: null,
     hlsKey: null,
-    hasAudio: null,
-    availableQualities: []
+    initialReady: false,
+    initialQuality: null,
+    completedQualities: [],
+    videoQualities: [],
+    hasAudio: null
   };
   jobs.set(id, job);
   queue.push(job);
@@ -344,8 +347,10 @@ app.get('/jobs/:id', auth, (req, res) => {
     hlsUrl: job.hlsUrl || null,
     hlsKey: job.hlsKey || null,
     hasAudio: job.hasAudio,
-    videoQualities: job.videoQualities || [],
-    availableQualities: job.availableQualities || []
+    initialReady: !!job.initialReady,
+    initialQuality: job.initialQuality || null,
+    completedQualities: job.completedQualities || [],
+    videoQualities: job.videoQualities || []
   });
 });
 

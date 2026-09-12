@@ -1,23 +1,18 @@
-{
-  "rules": [
-    {
-      "allowed": {
-        "origins": [
-          "https://flaynity.indevs.in"
-        ],
-        "methods": [
-          "GET",
-          "HEAD",
-          "PUT"
-        ],
-        "headers": [
-          "Content-Type"
-        ]
-      },
-      "exposeHeaders": [
-        "ETag"
-      ],
-      "maxAgeSeconds": 86400
-    }
-  ]
-}
+[
+  {
+    "AllowedOrigins": [
+      "https://flaynity.indevs.in",
+      "null"
+    ],
+    "AllowedMethods": [
+      "PUT"
+    ],
+    "AllowedHeaders": [
+      "Content-Type"
+    ],
+    "ExposeHeaders": [
+      "ETag"
+    ],
+    "MaxAgeSeconds": 3600
+  }
+]

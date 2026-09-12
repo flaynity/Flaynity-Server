@@ -6,7 +6,7 @@ const MAX_UPLOAD_EXPIRY = 900;
 function corsHeaders(env) {
   return {
     "Access-Control-Allow-Origin": env.APP_ORIGIN || "https://flaynity.indevs.in",
-    "Access-Control-Allow-Methods": "GET,HEAD,POST,PUT,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
@@ -356,50 +356,36 @@ async function handleHlsTranscodeStatus(request, env, jobId) {
       status: data.status || "queued",
       progress: Number(data.progress || 0),
       message: data.message || "",
-      initialReady: !!data.initialReady,
       hlsUrl: data.hlsUrl || null,
-      hlsKey: data.hlsKey || null,
-      videoQualities: Array.isArray(data.videoQualities) ? data.videoQualities : [],
-      completedQualities: Array.isArray(data.completedQualities) ? data.completedQualities : []
+      hlsKey: data.hlsKey || null
     }, 200, env);
   } catch (e) {
     return json({ error: `HLS transcoder status connection failed: ${e.message || e}` }, 503, env);
   }
 }
 
-async function handleUploadProxy(request, env) {
+async function handleMediaUpload(request, env) {
   try { await verifyFirebaseToken(request, env); }
   catch (e) { return unauthorized(env, e.message || "Unauthorized"); }
-
   const url = new URL(request.url);
   const key = sanitizeKey(url.searchParams.get("key"));
-  if (!key) return json({ error: "Invalid upload key" }, 400, env);
-  const contentType = String(request.headers.get("Content-Type") || "application/octet-stream").slice(0, 160);
+  if (!key) return json({ error: "Invalid media key" }, 400, env);
+  if (request.method !== "PUT" && request.method !== "POST") return json({ error: "Method not allowed" }, 405, env);
+  const contentType = String(request.headers.get("Content-Type") || "application/octet-stream").slice(0, 120);
+  if (!/^(image|video|audio)\//i.test(contentType)) return json({ error: "Unsupported content type" }, 400, env);
   if (!request.body) return json({ error: "Upload body is empty" }, 400, env);
-  if (!env.R2_ACCOUNT_ID || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
-    return json({ error: "R2 credentials are not configured on the Worker." }, 503, env);
-  }
-
   try {
-    const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.MEDIA_BUCKET_NAME || "flaynity-storage"}/${key}`;
-    const client = new AwsClient({
-      accessKeyId: env.R2_ACCESS_KEY_ID,
-      secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-      service: "s3",
-      region: "auto"
+    await env.MEDIA_BUCKET.put(key, request.body, {
+      httpMetadata: { contentType, cacheControl: "public, max-age=31536000, immutable" }
     });
-    const signed = await client.fetch(endpoint, {
-      method: "PUT",
-      headers: { "Content-Type": contentType },
-      body: request.body
-    });
-    if (!signed.ok) {
-      const text = await signed.text().catch(() => "");
-      return json({ error: `R2 upload failed (${signed.status})${text ? `: ${text.slice(0, 300)}` : ""}` }, 502, env);
-    }
-    return json({ ok: true, key, publicUrl: `${env.MEDIA_BASE_URL || `${url.origin}/media`}/${key.split('/').map(encodeURIComponent).join('/')}` }, 200, env);
+    const mediaBase = env.MEDIA_BASE_URL || `${url.origin}/media`;
+    return json({
+      ok: true,
+      key,
+      publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`
+    }, 200, env);
   } catch (e) {
-    return json({ error: e.message || "Worker upload failed" }, 502, env);
+    return json({ error: e?.message || "Could not upload media to R2" }, 502, env);
   }
 }
 
@@ -434,7 +420,7 @@ async function handleMedia(request, env, key) {
   obj.writeHttpMetadata(headers);
   headers.set("etag", obj.httpEtag);
   headers.set("Accept-Ranges", "bytes");
-  headers.set("Cache-Control", /\.m3u8$/i.test(key) ? "public, max-age=0, must-revalidate" : "public, max-age=31536000, immutable");
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
   Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
 
   const status = obj.range ? 206 : 200;
@@ -456,7 +442,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
 
     if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", time: Date.now() }, 200, env);
-    if (url.pathname === "/api/v1/media/upload" && request.method === "PUT") return handleUploadProxy(request, env);
+    if ((url.pathname === "/api/v1/media/upload" || url.pathname === "/api/v1/media/upload/") && (request.method === "PUT" || request.method === "POST")) return handleMediaUpload(request, env);
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
     if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") return handleHlsTranscode(request, env);
     if (url.pathname.startsWith("/api/v1/media/transcode/status/") && request.method === "GET") return handleHlsTranscodeStatus(request, env, url.pathname.slice("/api/v1/media/transcode/status/".length));

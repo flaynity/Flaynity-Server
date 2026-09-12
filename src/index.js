@@ -398,7 +398,7 @@ async function handleMedia(request, env, key) {
   obj.writeHttpMetadata(headers);
   headers.set("etag", obj.httpEtag);
   headers.set("Accept-Ranges", "bytes");
-  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("Cache-Control", /\.m3u8$/i.test(key) ? "public, max-age=0, must-revalidate" : "public, max-age=31536000, immutable");
   Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
 
   const status = obj.range ? 206 : 200;

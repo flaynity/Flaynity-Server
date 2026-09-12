@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
-import { createWriteStream, createReadStream } from 'node:fs';
+import { createWriteStream } from 'node:fs';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 
 const app = express();
@@ -77,15 +77,15 @@ function publicUrl(key) {
   return `${PUBLIC_BASE}/${key.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-async function putFile(file, key, type, cacheControl = 'public, max-age=31536000, immutable') {
+async function putFile(file, key, type) {
   // A single segment/playlist is read at a time, never the whole HLS directory.
-  const body = createReadStream(file);
+  const body = await fs.readFile(file);
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
     Body: body,
     ContentType: type,
-    CacheControl: cacheControl
+    CacheControl: 'public, max-age=31536000, immutable'
   }));
 }
 
@@ -109,52 +109,16 @@ async function hasAudioStream(file) {
   });
 }
 
-async function probeVideoDimensions(file) {
-  return await new Promise((resolve, reject) => {
-    const p = spawn('ffprobe', [
-      '-v', 'error',
-      '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height',
-      '-of', 'csv=p=0:s=x',
-      file
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    p.stdout.on('data', d => out += d.toString());
-    p.stderr.on('data', d => err += d.toString());
-    p.on('error', reject);
-    p.on('close', code => {
-      if (code !== 0) return reject(new Error(`ffprobe video dimensions failed: ${err.slice(-1000)}`));
-      const m = out.trim().match(/^(\d+)x(\d+)$/);
-      if (!m) return reject(new Error('Could not detect original video dimensions.'));
-      resolve({ width: Number(m[1]), height: Number(m[2]) });
-    });
-  });
-}
-
-function fitDimensions(srcW, srcH, maxW, maxH) {
-  const scale = Math.min(maxW / srcW, maxH / srcH, 1);
-  let width = Math.max(2, Math.round(srcW * scale / 2) * 2);
-  let height = Math.max(2, Math.round(srcH * scale / 2) * 2);
-  return { width, height };
-}
-
 async function uploadDirectory(dir, prefix) {
-  const names = (await fs.readdir(dir)).filter(name => name.endsWith('.m3u8') || name.endsWith('.ts'));
-  const concurrency = 4;
-  let cursor = 0;
-  async function worker() {
-    while (true) {
-      const i = cursor++;
-      if (i >= names.length) return;
-      const name = names[i];
-      const full = path.join(dir, name);
-      const ext = path.extname(name).toLowerCase();
-      const type = ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
-      await putFile(full, `${prefix}/${name}`, type);
-    }
+  const names = await fs.readdir(dir);
+  for (const name of names) {
+    const full = path.join(dir, name);
+    const stat = await fs.stat(full);
+    if (!stat.isFile()) continue;
+    const ext = path.extname(name).toLowerCase();
+    const type = ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
+    await putFile(full, `${prefix}/${name}`, type);
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, names.length) }, worker));
 }
 
 function makeMaster(variants, audio) {
@@ -183,23 +147,18 @@ async function transcode(job) {
 
     job.progress = 10;
     const audio = await hasAudioStream(input);
-    const sourceSize = await probeVideoDimensions(input);
     job.hasAudio = audio;
-    job.sourceWidth = sourceSize.width;
-    job.sourceHeight = sourceSize.height;
     job.message = audio ? 'Preparing HLS with audio' : 'Preparing HLS (source has no audio)';
 
     const variants = [];
 
-    // Render 144p first. This is the only rendition required before the post can
-    // be published. The remaining ladder continues in this same worker process.
+    // IMPORTANT: encode one rendition at a time. This is the key RAM fix for
+    // Render Free. The final HLS master still exposes all completed qualities.
     for (let i = 0; i < LADDER.length; i++) {
-      const base = LADDER[i];
-      const dims = fitDimensions(sourceSize.width, sourceSize.height, base.width, base.height);
-      const q = { ...base, width: dims.width, height: dims.height };
+      const q = LADDER[i];
       job.qualityIndex = i;
       job.message = `Encoding ${q.name}${audio ? ' + audio' : ''} (${i + 1}/${LADDER.length})`;
-      job.progress = i === 0 ? 12 : 35 + Math.round(((i - 1) / Math.max(1, LADDER.length - 2)) * 55);
+      job.progress = 12 + Math.round((i / LADDER.length) * 65);
 
       const dir = path.join(hlsRoot, q.name);
       await fs.mkdir(dir);
@@ -209,17 +168,17 @@ async function transcode(job) {
         '-i', input,
         '-map', '0:v:0',
         ...(audio ? ['-map', '0:a:0?'] : []),
-        '-vf', `scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`,
+        '-vf', `scale=w=${q.width}:h=${q.height}:force_original_aspect_ratio=decrease,pad=${q.width}:${q.height}:(ow-iw)/2:(oh-ih)/2`,
         '-c:v', 'libx264',
-        '-preset', i === 0 ? 'ultrafast' : 'veryfast',
-        '-threads', i === 0 ? '2' : '1',
+        '-preset', 'veryfast',
+        '-threads', '1',
         '-profile:v', q.profile,
         '-pix_fmt', 'yuv420p',
         '-b:v', q.v,
         '-maxrate', q.max,
         '-bufsize', q.buf,
-        '-g', '48',
-        '-keyint_min', '48',
+        '-g', '24',
+        '-keyint_min', '24',
         '-sc_threshold', '0'
       ];
 
@@ -229,7 +188,7 @@ async function transcode(job) {
 
       args.push(
         '-f', 'hls',
-        '-hls_time', '2',
+        '-hls_time', '1',
         '-hls_playlist_type', 'vod',
         '-hls_list_size', '0',
         '-hls_flags', 'independent_segments',
@@ -240,37 +199,27 @@ async function transcode(job) {
       await run('ffmpeg', args, work, job);
       variants.push(q);
 
-      // Publish the newly completed rendition immediately. For 144p this makes
-      // playback available before any other quality has finished.
-      await uploadDirectory(dir, `uploads/hls/${job.id}/${q.name}`);
-
-      const master = makeMaster(variants, audio);
-      const masterPath = path.join(hlsRoot, 'master.m3u8');
-      await fs.writeFile(masterPath, master, 'utf8');
-      await putFile(masterPath, `uploads/hls/${job.id}/master.m3u8`, 'application/vnd.apple.mpegurl', 'public, max-age=0, must-revalidate');
-
-      job.hlsUrl = publicUrl(`uploads/hls/${job.id}/master.m3u8`);
-      job.hlsKey = `uploads/hls/${job.id}/master.m3u8`;
-      job.completedQualities = variants.map(v => v.name);
-      job.videoQualities = variants.map(v => ({ quality: v.name, url: publicUrl(`uploads/hls/${job.id}/${v.name}/index.m3u8`) }));
-
-      if (i === 0) {
-        job.initialReady = true;
-        job.initialQuality = '144p';
-        job.progress = 30;
-        job.message = '144p ready — published; higher qualities are processing in background';
-      } else if (i < LADDER.length - 1) {
-        job.message = `${q.name} ready — continuing higher qualities in background`;
-      }
+      // Free FFmpeg's output buffers before starting the next rendition.
+      await new Promise(r => setTimeout(r, 50));
     }
+
+    const master = makeMaster(variants, audio);
+    await fs.writeFile(path.join(hlsRoot, 'master.m3u8'), master, 'utf8');
+
+    job.progress = 82;
+    job.message = 'Publishing HLS to R2';
+
+    // Upload one file at a time to keep Node memory bounded.
+    for (const q of variants) {
+      await uploadDirectory(path.join(hlsRoot, q.name), `uploads/hls/${job.id}/${q.name}`);
+    }
+    await putFile(path.join(hlsRoot, 'master.m3u8'), `uploads/hls/${job.id}/master.m3u8`, 'application/vnd.apple.mpegurl');
 
     job.status = 'ready';
     job.progress = 100;
-    job.initialReady = true;
-    job.message = audio ? 'All HLS qualities ready' : 'All HLS qualities ready (source has no audio track)';
+    job.message = audio ? 'Ready with audio' : 'Ready (source has no audio track)';
     job.hlsUrl = publicUrl(`uploads/hls/${job.id}/master.m3u8`);
     job.hlsKey = `uploads/hls/${job.id}/master.m3u8`;
-    job.completedQualities = variants.map(v => v.name);
     job.videoQualities = variants.map(v => ({ quality: v.name, url: publicUrl(`uploads/hls/${job.id}/${v.name}/index.m3u8`) }));
   } catch (e) {
     job.status = 'failed';
@@ -319,14 +268,10 @@ app.post('/jobs', auth, (req, res) => {
     sourceKey,
     status: 'queued',
     progress: 0,
-    message: 'Queued (memory-safe single transcode)' ,
+    message: 'Queued (one transcode at a time)',
     createdAt: Date.now(),
     hlsUrl: null,
     hlsKey: null,
-    initialReady: false,
-    initialQuality: null,
-    completedQualities: [],
-    videoQualities: [],
     hasAudio: null
   };
   jobs.set(id, job);
@@ -347,9 +292,6 @@ app.get('/jobs/:id', auth, (req, res) => {
     hlsUrl: job.hlsUrl || null,
     hlsKey: job.hlsKey || null,
     hasAudio: job.hasAudio,
-    initialReady: !!job.initialReady,
-    initialQuality: job.initialQuality || null,
-    completedQualities: job.completedQualities || [],
     videoQualities: job.videoQualities || []
   });
 });

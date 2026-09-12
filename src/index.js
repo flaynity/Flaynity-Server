@@ -202,11 +202,11 @@ async function streamApiFetch(env, path, options = {}) {
 
 function handleStreamCapability(env) {
   return json({
-    enabled: !!(String(env.TRANSCODER_URL || '').trim() && String(env.TRANSCODER_SECRET || '').trim()),
-    provider: 'r2-hls',
+    enabled: !!String(env.CLOUDFLARE_STREAM_API_TOKEN || '').trim(),
+    provider: 'cloudflare-stream',
     preferredQualityLadder: [144, 360, 480, 720, 1080],
-    advertisedMinimum: 144,
-    note: 'Flaynity uses self-hosted FFmpeg HLS on R2; playback starts at 144p and then ABR climbs with available bandwidth.'
+    advertisedMinimum: 360,
+    note: '144p is only used if Stream exposes a 144p rendition; otherwise the player starts at the closest available level (normally 360p).'
   }, 200, env);
 }
 
@@ -300,70 +300,6 @@ async function handleStreamStatus(request, env, uid) {
   } catch (e) { return json({ error: e.message || "Could not read Stream status" }, 503, env); }
 }
 
-
-
-async function handleHlsTranscode(request, env) {
-  try { await verifyFirebaseToken(request, env); }
-  catch (e) { return unauthorized(env, e.message || "Unauthorized"); }
-
-  if (!env.TRANSCODER_URL || !env.TRANSCODER_SECRET) {
-    return json({ error: "HLS transcoder is not configured on the Worker." }, 503, env);
-  }
-  let body;
-  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400, env); }
-  const sourceKey = String(body?.sourceKey || "").replace(/^\/+/, "");
-  if (!/^uploads\/(feels|videos)\/[a-zA-Z0-9._-]+$/.test(sourceKey) || sourceKey.includes("..")) {
-    return json({ error: "Invalid source key" }, 400, env);
-  }
-
-  try {
-    const response = await fetch(`${String(env.TRANSCODER_URL).replace(/\/+$/, "")}/jobs`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-flaynity-transcoder-secret": String(env.TRANSCODER_SECRET)
-      },
-      body: JSON.stringify({ sourceKey })
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.jobId) {
-      return json({ error: data.error || `Transcoder job creation failed (${response.status})` }, 502, env);
-    }
-    return json({ jobId: data.jobId, status: data.status || "queued", provider: "r2-hls" }, 202, env);
-  } catch (e) {
-    return json({ error: `HLS transcoder connection failed: ${e.message || e}` }, 503, env);
-  }
-}
-
-async function handleHlsTranscodeStatus(request, env, jobId) {
-  try { await verifyFirebaseToken(request, env); }
-  catch (e) { return unauthorized(env, e.message || "Unauthorized"); }
-
-  if (!env.TRANSCODER_URL || !env.TRANSCODER_SECRET) {
-    return json({ error: "HLS transcoder is not configured on the Worker." }, 503, env);
-  }
-  const id = String(jobId || "").trim();
-  if (!id || !/^[a-zA-Z0-9_-]+$/.test(id)) return json({ error: "Invalid job ID" }, 400, env);
-  try {
-    const response = await fetch(`${String(env.TRANSCODER_URL).replace(/\/+$/, "")}/jobs/${encodeURIComponent(id)}`, {
-      method: "GET",
-      headers: { "x-flaynity-transcoder-secret": String(env.TRANSCODER_SECRET) }
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) return json({ error: data.error || `Transcoder status failed (${response.status})` }, response.status === 404 ? 404 : 502, env);
-    return json({
-      jobId: data.id || id,
-      status: data.status || "queued",
-      progress: Number(data.progress || 0),
-      message: data.message || "",
-      hlsUrl: data.hlsUrl || null,
-      hlsKey: data.hlsKey || null
-    }, 200, env);
-  } catch (e) {
-    return json({ error: `HLS transcoder status connection failed: ${e.message || e}` }, 503, env);
-  }
-}
-
 async function handleUploadUrl(request, env) {
   try {
     await verifyFirebaseToken(request, env);
@@ -418,8 +354,6 @@ export default {
 
     if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", time: Date.now() }, 200, env);
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
-    if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") return handleHlsTranscode(request, env);
-    if (url.pathname.startsWith("/api/v1/media/transcode/status/") && request.method === "GET") return handleHlsTranscodeStatus(request, env, url.pathname.slice("/api/v1/media/transcode/status/".length));
     if (url.pathname === "/api/v1/stream/capability" && request.method === "GET") return handleStreamCapability(env);
     if (url.pathname === "/api/v1/stream/upload-url" && request.method === "POST") return handleStreamUploadUrl(request, env);
     if (url.pathname === "/api/v1/stream/tus-url" && request.method === "POST") return handleStreamTusUrl(request, env);

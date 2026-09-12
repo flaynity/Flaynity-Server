@@ -78,14 +78,16 @@ function publicUrl(key) {
 }
 
 async function putFile(file, key, type) {
-  // A single segment/playlist is read at a time, never the whole HLS directory.
+  // Playlists must revalidate while a job is still building. Segments are
+  // immutable and can stay cached for a year.
+  const isPlaylist = type === 'application/vnd.apple.mpegurl';
   const body = createReadStream(file);
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
     Body: body,
     ContentType: type,
-    CacheControl: 'public, max-age=31536000, immutable'
+    CacheControl: isPlaylist ? 'public, max-age=0, must-revalidate' : 'public, max-age=31536000, immutable'
   }));
 }
 
@@ -218,8 +220,11 @@ async function transcode(job) {
         '-b:v', q.v,
         '-maxrate', q.max,
         '-bufsize', q.buf,
-        '-g', '24',
-        '-keyint_min', '24',
+        // Force an IDR every 2 seconds so HLS can start on small, aligned
+        // segments and switch qualities cleanly.
+        '-force_key_frames', 'expr:gte(t,n_forced*2)',
+        '-g', '120',
+        '-keyint_min', '48',
         '-sc_threshold', '0'
       ];
 
@@ -229,7 +234,7 @@ async function transcode(job) {
 
       args.push(
         '-f', 'hls',
-        '-hls_time', '1',
+        '-hls_time', '2',
         '-hls_playlist_type', 'vod',
         '-hls_list_size', '0',
         '-hls_flags', 'independent_segments',
@@ -240,28 +245,33 @@ async function transcode(job) {
       await run('ffmpeg', args, work, job);
       variants.push(q);
 
+      // Publish each completed rendition immediately. This is what lets the
+      // app start at 144p instead of waiting for the complete ladder.
+      await uploadDirectory(path.join(hlsRoot, q.name), `uploads/hls/${job.id}/${q.name}`);
+      const master = makeMaster(variants, audio);
+      await fs.writeFile(path.join(hlsRoot, 'master.m3u8'), master, 'utf8');
+      await putFile(path.join(hlsRoot, 'master.m3u8'), `uploads/hls/${job.id}/master.m3u8`, 'application/vnd.apple.mpegurl');
+
+      job.hlsUrl = publicUrl(`uploads/hls/${job.id}/master.m3u8`);
+      job.hlsKey = `uploads/hls/${job.id}/master.m3u8`;
+      job.videoQualities = variants.map(v => ({ quality: v.name, url: publicUrl(`uploads/hls/${job.id}/${v.name}/index.m3u8`) }));
+      job.availableQualities = variants.map(v => Number.parseInt(v.name, 10));
+      if (variants.length === 1) {
+        job.status = 'playable';
+        job.message = '144p ready — playback can start while higher qualities render.';
+      } else {
+        job.status = 'processing';
+        job.message = `${q.name} ready — higher qualities continue in background.`;
+      }
+      job.progress = 15 + Math.round((i + 1) / LADDER.length * 70);
+
       // Free FFmpeg's output buffers before starting the next rendition.
       await new Promise(r => setTimeout(r, 50));
     }
 
-    const master = makeMaster(variants, audio);
-    await fs.writeFile(path.join(hlsRoot, 'master.m3u8'), master, 'utf8');
-
-    job.progress = 82;
-    job.message = 'Publishing HLS to R2';
-
-    // Upload one file at a time to keep Node memory bounded.
-    for (const q of variants) {
-      await uploadDirectory(path.join(hlsRoot, q.name), `uploads/hls/${job.id}/${q.name}`);
-    }
-    await putFile(path.join(hlsRoot, 'master.m3u8'), `uploads/hls/${job.id}/master.m3u8`, 'application/vnd.apple.mpegurl');
-
     job.status = 'ready';
     job.progress = 100;
-    job.message = audio ? 'Ready with audio' : 'Ready (source has no audio track)';
-    job.hlsUrl = publicUrl(`uploads/hls/${job.id}/master.m3u8`);
-    job.hlsKey = `uploads/hls/${job.id}/master.m3u8`;
-    job.videoQualities = variants.map(v => ({ quality: v.name, url: publicUrl(`uploads/hls/${job.id}/${v.name}/index.m3u8`) }));
+    job.message = audio ? 'All HLS qualities ready' : 'All HLS qualities ready (source has no audio track)';
   } catch (e) {
     job.status = 'failed';
     job.progress = 0;
@@ -313,7 +323,8 @@ app.post('/jobs', auth, (req, res) => {
     createdAt: Date.now(),
     hlsUrl: null,
     hlsKey: null,
-    hasAudio: null
+    hasAudio: null,
+    availableQualities: []
   };
   jobs.set(id, job);
   queue.push(job);
@@ -333,7 +344,8 @@ app.get('/jobs/:id', auth, (req, res) => {
     hlsUrl: job.hlsUrl || null,
     hlsKey: job.hlsKey || null,
     hasAudio: job.hasAudio,
-    videoQualities: job.videoQualities || []
+    videoQualities: job.videoQualities || [],
+    availableQualities: job.availableQualities || []
   });
 });
 

@@ -6,7 +6,7 @@ const MAX_UPLOAD_EXPIRY = 900;
 function corsHeaders(env) {
   return {
     "Access-Control-Allow-Origin": env.APP_ORIGIN || "https://flaynity.indevs.in",
-    "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,HEAD,POST,PUT,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
@@ -367,6 +367,42 @@ async function handleHlsTranscodeStatus(request, env, jobId) {
   }
 }
 
+async function handleUploadProxy(request, env) {
+  try { await verifyFirebaseToken(request, env); }
+  catch (e) { return unauthorized(env, e.message || "Unauthorized"); }
+
+  const url = new URL(request.url);
+  const key = sanitizeKey(url.searchParams.get("key"));
+  if (!key) return json({ error: "Invalid upload key" }, 400, env);
+  const contentType = String(request.headers.get("Content-Type") || "application/octet-stream").slice(0, 160);
+  if (!request.body) return json({ error: "Upload body is empty" }, 400, env);
+  if (!env.R2_ACCOUNT_ID || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) {
+    return json({ error: "R2 credentials are not configured on the Worker." }, 503, env);
+  }
+
+  try {
+    const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.MEDIA_BUCKET_NAME || "flaynity-storage"}/${key}`;
+    const client = new AwsClient({
+      accessKeyId: env.R2_ACCESS_KEY_ID,
+      secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+      service: "s3",
+      region: "auto"
+    });
+    const signed = await client.fetch(endpoint, {
+      method: "PUT",
+      headers: { "Content-Type": contentType },
+      body: request.body
+    });
+    if (!signed.ok) {
+      const text = await signed.text().catch(() => "");
+      return json({ error: `R2 upload failed (${signed.status})${text ? `: ${text.slice(0, 300)}` : ""}` }, 502, env);
+    }
+    return json({ ok: true, key, publicUrl: `${env.MEDIA_BASE_URL || `${url.origin}/media`}/${key.split('/').map(encodeURIComponent).join('/')}` }, 200, env);
+  } catch (e) {
+    return json({ error: e.message || "Worker upload failed" }, 502, env);
+  }
+}
+
 async function handleUploadUrl(request, env) {
   try {
     await verifyFirebaseToken(request, env);
@@ -420,6 +456,7 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
 
     if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", time: Date.now() }, 200, env);
+    if (url.pathname === "/api/v1/media/upload" && request.method === "PUT") return handleUploadProxy(request, env);
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
     if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") return handleHlsTranscode(request, env);
     if (url.pathname.startsWith("/api/v1/media/transcode/status/") && request.method === "GET") return handleHlsTranscodeStatus(request, env, url.pathname.slice("/api/v1/media/transcode/status/".length));

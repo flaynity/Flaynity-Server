@@ -356,9 +356,11 @@ async function handleHlsTranscodeStatus(request, env, jobId) {
       status: data.status || "queued",
       progress: Number(data.progress || 0),
       message: data.message || "",
-      hlsUrl: data.hlsUrl || (data.id || id ? `https://cdn.flaynity.indevs.in/media/uploads/hls/${data.id || id}/master.m3u8` : null),
-      hlsKey: data.hlsKey || `uploads/hls/${data.id || id}/master.m3u8`,
-      availableQualities: Array.isArray(data.availableQualities) ? data.availableQualities : []
+      initialReady: !!data.initialReady,
+      hlsUrl: data.hlsUrl || null,
+      hlsKey: data.hlsKey || null,
+      videoQualities: Array.isArray(data.videoQualities) ? data.videoQualities : [],
+      completedQualities: Array.isArray(data.completedQualities) ? data.completedQualities : []
     }, 200, env);
   } catch (e) {
     return json({ error: `HLS transcoder status connection failed: ${e.message || e}` }, 503, env);
@@ -396,8 +398,7 @@ async function handleMedia(request, env, key) {
   obj.writeHttpMetadata(headers);
   headers.set("etag", obj.httpEtag);
   headers.set("Accept-Ranges", "bytes");
-  const isHlsPlaylist = /\.m3u8$/i.test(key);
-  headers.set("Cache-Control", isHlsPlaylist ? "public, max-age=0, must-revalidate" : "public, max-age=31536000, immutable");
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
   Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
 
   const status = obj.range ? 206 : 200;

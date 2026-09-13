@@ -57,8 +57,14 @@ async function processJob(job) {
   return job;
 }
 const server = http.createServer(async (req, res) => {
+  // Health check is public so Render/Cloudflare/browser monitoring can verify
+  // that the processor is alive without exposing the job token.
+  if (req.method === "GET" && req.url === "/health") {
+    return json(res, 200, { ok: true, service: "flaynity-ffmpeg-processor", ffmpeg: true });
+  }
+
+  // All job/process endpoints remain protected by the shared processor token.
   if (!authorized(req)) return json(res, 401, { error: "Unauthorized processor request" });
-  if (req.method === "GET" && req.url === "/health") return json(res, 200, { ok: true, service: "flaynity-ffmpeg-processor", ffmpeg: true });
   if (req.method === "POST" && req.url === "/process") {
     try { const b = await parse(req); if (!b.jobId || !b.sourceUrl) return json(res, 400, { error: "jobId and sourceUrl are required" }); if (jobs.has(b.jobId)) return json(res, 200, jobs.get(b.jobId)); const job = { jobId: b.jobId, sourceKey: b.sourceKey || null, status: "queued", progress: 0, available: [], createdAt: Date.now() }; jobs.set(b.jobId, job); processJob(Object.assign(job, { sourceUrl: b.sourceUrl })).catch(e => { job.status = "failed"; job.error = e.message || String(e); }); return json(res, 202, job); } catch (e) { return json(res, 400, { error: e.message || "Invalid JSON" }); }
   }

@@ -1,10 +1,9 @@
 name = "flaynity-server"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2026-09-09"
 workers_dev = true
 
-# IMPORTANT: This is the EXISTING R2 bucket already used by the Flaynity app.
-# Do NOT create another bucket. The Worker is bound to this same bucket.
+# IMPORTANT: Use the existing Flaynity R2 bucket.
 [[r2_buckets]]
 binding = "MEDIA_BUCKET"
 bucket_name = "flaynity-storage"

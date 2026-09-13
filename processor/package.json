@@ -1,0 +1,8 @@
+{
+  "name": "flaynity-ffmpeg-processor",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "aws4fetch": "^1.0.20" }
+}

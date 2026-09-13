@@ -1,3 +1,5 @@
 # Local development only. NEVER commit real credentials.
 R2_ACCESS_KEY_ID=
 R2_SECRET_ACCESS_KEY=
+FFMPEG_PROCESSOR_URL=
+FFMPEG_PROCESSOR_TOKEN=

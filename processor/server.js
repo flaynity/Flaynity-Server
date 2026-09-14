@@ -78,7 +78,7 @@ async function s3Request(key, options = {}) {
   return client.fetch(`https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${bucket}/${key}`, options);
 }
 async function s3Put(key, body, contentType) {
-  const mutable = key.endsWith("/master.m3u8") || key.startsWith("internal/");
+  const mutable = key.endsWith(".m3u8") || key.startsWith("internal/");
   const response = await s3Request(key, { method: "PUT", headers: { "Content-Type": contentType, "Cache-Control": mutable ? "no-store" : "public, max-age=31536000, immutable" }, body });
   if (!response.ok) throw new Error(`R2 upload failed (${response.status})`);
 }
@@ -94,7 +94,6 @@ async function getJob(id) {
 }
 async function uploadTree(dir, prefix) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
-  // Publish every segment BEFORE exposing the variant playlist.
   entries.sort((a, b) => Number(a.name.endsWith(".m3u8")) - Number(b.name.endsWith(".m3u8")));
   for (const e of entries) {
     const full = path.join(dir, e.name), key = `${prefix}/${e.name}`;
@@ -103,27 +102,76 @@ async function uploadTree(dir, prefix) {
   }
 }
 async function prepare(root, job) {
-  const response = await fetch(job.sourceUrl);
-  if (!response.ok || !response.body) throw new Error(`Source download failed (${response.status})`);
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(path.join(root, "source")));
-  const info = JSON.parse(await run("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", path.join(root, "source")], root));
+  // Probe the R2/CDN source directly. This removes the old requirement to
+  // download an entire long video before the first FFmpeg frame can start.
+  const info = JSON.parse(await run("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", job.sourceUrl], root));
   const stream = info.streams.find(s => s.codec_type === "video");
   if (!stream) throw new Error("Source has no video stream");
   job.source = { ...sourceGeometry(stream), duration: Number(info.format?.duration) || 0, hasAudio: info.streams.some(s => s.codec_type === "audio") };
 }
-export async function encode(root, job, q) {
+async function encodeStreaming(root, job, q, onEarlyReady) {
   const size = renditionGeometry(job.source, q);
-  await fs.mkdir(path.join(root, q.name), { recursive: true });
-  // The rendition dimensions are already calculated from the source display
-  // aspect ratio. Encode with square pixels (SAR 1:1) so HLS.js/native players
-  // see the real coded width/height instead of relying on a non-square SAR.
-  // This preserves arbitrary portrait, landscape and square uploads.
+  const dir = path.join(root, q.name);
+  await fs.mkdir(dir, { recursive: true });
   const filter = `scale=${size.width}:${size.height}:force_original_aspect_ratio=disable,setsar=1,fps=24,setpts=PTS-STARTPTS`;
-  await run("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", "-i", path.join(root, "source"), "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-vf", filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", q.name === "144p" ? "ultrafast" : "veryfast", "-threads", "2", "-profile:v", "main", "-b:v", q.videoBitrate, "-maxrate", q.maxrate, "-bufsize", q.bufsize, "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)", "-metadata:s:v:0", "rotate=0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000", "-af", "aresample=async=1:first_pts=0", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_flags", "independent_segments", "-hls_segment_filename", path.join(root, q.name, "seg_%05d.ts"), path.join(root, q.name, "index.m3u8")], root);
+  const playlist = path.join(dir, "index.m3u8");
+  const input = job.sourceUrl || path.join(root, "source");
+  const child = spawn("ffmpeg", [
+    "-y", "-hide_banner", "-loglevel", "error", "-i", input,
+    "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-vf", filter,
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", q.name === "144p" ? "ultrafast" : "veryfast", "-threads", "2",
+    "-profile:v", "main", "-b:v", q.videoBitrate, "-maxrate", q.maxrate, "-bufsize", q.bufsize,
+    "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
+    "-metadata:s:v:0", "rotate=0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000", "-af", "aresample=async=1:first_pts=0",
+    "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "event", "-hls_flags", "independent_segments+append_list",
+    "-hls_segment_filename", path.join(dir, "seg_%05d.ts"), playlist
+  ], root, { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", d => { stderr = (stderr + d).slice(-12000); });
+  let earlyReady = false, uploaded = new Set(), lastPlaylist = "", lastProgress = 0;
+  const prefix = `uploads/hls/${job.jobId}/${q.name}`;
+  const flush = async (final = false) => {
+    const names = (await fs.readdir(dir)).filter(n => n.endsWith(".ts")).sort();
+    for (const name of names) {
+      if (uploaded.has(name)) continue;
+      const full = path.join(dir, name);
+      try { await fs.access(full); await s3Put(`${prefix}/${name}`, await fs.readFile(full), "video/mp2t"); uploaded.add(name); }
+      catch {}
+    }
+    try {
+      const text = await fs.readFile(playlist, "utf8");
+      if (text !== lastPlaylist && (uploaded.size || final)) {
+        await s3Put(`${prefix}/index.m3u8`, text, "application/vnd.apple.mpegurl");
+        lastPlaylist = text;
+      }
+    } catch {}
+    if (!earlyReady && uploaded.size >= 2 && lastPlaylist) {
+      earlyReady = true;
+      await onEarlyReady(size);
+    }
+    const progress = job.source.duration > 0 ? Math.min(99, Math.round((uploaded.size * 2) / job.source.duration * 100)) : 0;
+    if (progress > lastProgress) { lastProgress = progress; job.progress = progress; await saveJob(job); }
+  };
+  const exitPromise = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", code => code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-4000)}`)));
+  });
+  while (child.exitCode === null) {
+    await sleep(800);
+    await flush(false);
+  }
+  await exitPromise;
+  await flush(true);
+  Object.defineProperty(size, "__flaynityUploaded", { value: true, enumerable: false });
   return size;
 }
+async function encode(root, job, q, onEarlyReady) {
+  return encodeStreaming(root, job, q, onEarlyReady);
+}
 async function notify(job) {
-  if (!job.publishedAt || !job.callbackUrl) return;
+  // A 144p job must notify the Worker before the full encode finishes so
+  // Firebase can publish the HLS URL as soon as the first segments exist.
+  if (!job.callbackUrl || !job.available?.includes("144p")) return;
   let error;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
@@ -148,19 +196,44 @@ export async function processStage(job, background = false, io = defaultIO) {
       if (job.available.includes(q.name)) continue;
       job.currentQuality = q.name;
       await io.save(job);
-      const size = await io.encode(root, job, q);
+      let earlyPublished = false;
+      const earlyReady = !background && q.name === "144p" ? async (size) => {
+        if (earlyPublished) return;
+        earlyPublished = true;
+        const prefix = `uploads/hls/${job.jobId}`;
+        const next = { ...job.renditions, [q.name]: size };
+        const manifest = masterPlaylist(next, job.source.hasAudio);
+        await io.put(`${prefix}/master-v1.m3u8`, manifest, "application/vnd.apple.mpegurl");
+        await io.put(`${prefix}/master.m3u8`, manifest, "application/vnd.apple.mpegurl");
+        job.renditions = next;
+        job.available = qualities.filter(item => next[item.name]).map(item => item.name);
+        job.manifestVersion = 1;
+        job.progress = Math.max(1, Math.round(1 / qualities.length * 100));
+        job.currentQuality = null;
+        job.status = "ready-144p";
+        await io.save(job);
+        // Tell the Worker immediately. It can confirm Firebase publication and
+        // return the HLS URL while FFmpeg continues encoding the full 144p file.
+        await io.notify(job);
+      } : null;
+      const size = await io.encode(root, job, q, earlyReady);
       const prefix = `uploads/hls/${job.jobId}`;
-      await io.upload(path.join(root, q.name), `${prefix}/${q.name}`);
+      // Legacy/test IO adapters may not stream-upload. The production encoder
+      // marks its result as already uploaded, so it is never uploaded twice.
+      if (!size?.__flaynityUploaded) await io.upload(path.join(root, q.name), `${prefix}/${q.name}`);
       const next = { ...job.renditions, [q.name]: size };
       const manifest = masterPlaylist(next, job.source.hasAudio);
       const version = Object.keys(next).length;
+      // encodeStreaming has already uploaded the variant playlist and segments
+      // incrementally. Only the master needs to be refreshed here.
       await io.put(`${prefix}/master-v${version}.m3u8`, manifest, "application/vnd.apple.mpegurl");
       await io.put(`${prefix}/master.m3u8`, manifest, "application/vnd.apple.mpegurl");
-      // Only advertise a quality after BOTH playlists and all segments exist.
-      job.renditions = next; job.available = qualities.filter(q => next[q.name]).map(q => q.name);
-      job.manifestVersion = version; job.progress = Math.round(version / qualities.length * 100);
+      job.renditions = next;
+      job.available = qualities.filter(item => next[item.name]).map(item => item.name);
+      job.manifestVersion = version;
+      job.progress = Math.round(job.available.length / qualities.length * 100);
       job.currentQuality = null;
-      job.status = !background ? "ready-144p" : version === qualities.length ? "ready" : "processing-background";
+      job.status = version === qualities.length ? "ready" : (job.available.includes("144p") ? "ready-144p" : "processing-background");
       if (job.status === "ready") job.finishedAt = Date.now();
       await io.save(job);
       await io.notify(job);

@@ -20,14 +20,14 @@ function fakeIO(events, failUpload) {
   };
 }
 
-test('144p is the only pre-publication encode; renditions are advertised after upload', async () => {
+test('360p is the only pre-publication encode; renditions are advertised after upload', async () => {
   const events = [], job = makeJob();
   await processStage(job, false, fakeIO(events));
-  assert.deepEqual(events.filter(e => e.startsWith('encode:')), ['encode:144p']);
-  assert.deepEqual(job.available, ['144p']);
-  assert.equal(job.status, 'ready-144p');
-  assert.ok(events.indexOf('upload:144p') < events.indexOf('put:master-v1.m3u8'));
-  assert.ok(events.indexOf('put:master.m3u8') < events.indexOf('status:ready-144p:144p'));
+  assert.deepEqual(events.filter(e => e.startsWith('encode:')), ['encode:360p']);
+  assert.deepEqual(job.available, ['360p']);
+  assert.equal(job.status, 'ready-360p');
+  assert.ok(events.indexOf('upload:360p') < events.indexOf('put:master-v1.m3u8'));
+  assert.ok(events.indexOf('put:master.m3u8') < events.indexOf('status:ready-360p:360p'));
   await assert.rejects(processStage(job, true, fakeIO(events)), /publication must be confirmed/);
   job.publishedAt = Date.now();
   await processStage(job, true, fakeIO(events));
@@ -37,13 +37,13 @@ test('144p is the only pre-publication encode; renditions are advertised after u
   assert.deepEqual(job.available, qualities.map(q => q.name));
 });
 
-test('failed background upload keeps published 144p and never advertises failed quality', async () => {
+test('failed background upload keeps published 360p and never advertises failed quality', async () => {
   const events = [], job = makeJob();
   await processStage(job, false, fakeIO(events));
   job.publishedAt = Date.now();
   await processStage(job, true, fakeIO(events, '360p'));
   assert.equal(job.status, 'ready-partial');
-  assert.deepEqual(job.available, ['144p']);
+  assert.deepEqual(job.available, ['360p']);
   assert.equal(job.manifestVersion, 1);
   assert.ok(!events.includes('encode:480p'));
   assert.ok(!events.includes('put:master-v2.m3u8'));
@@ -51,27 +51,27 @@ test('failed background upload keeps published 144p and never advertises failed 
 
 test('failed first upload is never playable', async () => {
   const job = makeJob();
-  await processStage(job, false, fakeIO([], '144p'));
+  await processStage(job, false, fakeIO([], '360p'));
   assert.equal(job.status, 'failed');
   assert.deepEqual(job.available, []);
 });
 
 test('manifest has real coded resolution and bits/second, not kilobits', () => {
-  const text = masterPlaylist({ '144p': { width: 144, height: 256 } });
-  assert.match(text, /AVERAGE-BANDWIDTH=316000/);
-  assert.match(text, /RESOLUTION=144x256/);
-  assert.ok(!text.includes('360p'));
-  assert.match(masterPlaylist({ '144p': { width: 256, height: 144 } }, false), /AVERAGE-BANDWIDTH=220000/);
+  const text = masterPlaylist({ '360p': { width: 640, height: 360 } });
+  assert.match(text, /AVERAGE-BANDWIDTH=746000/);
+  assert.match(text, /RESOLUTION=640x360/);
+  assert.ok(text.includes('360p'));
+  assert.match(masterPlaylist({ '360p': { width: 640, height: 360 } }, false), /AVERAGE-BANDWIDTH=220000/);
 });
 
 test('Firebase metadata exposes only ready renditions and checks matching owner/job/publication', () => {
-  const job = { ...makeJob(), available: ['144p'], manifestVersion: 1, source: { width: 1080, height: 1920, aspectRatio: 9 / 16 } };
+  const job = { ...makeJob(), available: ['360p'], manifestVersion: 1, source: { width: 1080, height: 1920, aspectRatio: 9 / 16 } };
   const metadata = playbackMetadata(env, job);
   assert.equal(metadata.resolution, '1080x1920');
-  assert.deepEqual(metadata.availableQualities, ['144p']);
+  assert.deepEqual(metadata.availableQualities, ['360p']);
   assert.match(metadata.hlsManifestUrl, /master-v1\.m3u8$/);
-  assert.ok(metadata.videoQualities['144p']);
-  assert.equal(metadata.videoQualities['360p'], undefined);
+  assert.ok(metadata.videoQualities['360p']);
+  assert.ok(metadata.videoQualities['360p']);
   const record = { ...metadata, userId: 'owner', status: 'published' };
   assert.equal(matchesPublication(record, job, env), true);
   for (const mismatch of [{ userId: 'other' }, { hlsJobId: 'other' }, { status: 'draft' }, { hlsUrl: 'missing' }]) assert.equal(matchesPublication({ ...record, ...mismatch }, job, env), false);
@@ -99,33 +99,33 @@ test('native HLS WebView starts the published playlist', () => {
 });
 test('quality labels use rendition names for portrait HLS and preserve manual choice on refresh', () => {
   const loaded = [];
-  const hls = { levels: [{ height: 256, url: ['https://cdn.test/144p/index.m3u8'] }, { height: 640, url: ['https://cdn.test/360p/index.m3u8'] }], autoLevelEnabled: false, loadLevel: 0, loadSource: url => loaded.push(url) };
+  const hls = { levels: [{ height: 360, url: ['https://cdn.test/360p/index.m3u8'] }, { height: 480, url: ['https://cdn.test/480p/index.m3u8'] }], autoLevelEnabled: false, loadLevel: 0, loadSource: url => loaded.push(url) };
   const video = { id: 'fly-video', _flaynityContentId: 'movie', _flaynityItem: { hlsManifestVersion: 1 }, currentTime: 12, paused: true, muted: true, playbackRate: 1.5 };
   const context = vm.createContext({ currentActiveMovie: null, hlsInstances: { fly_main: hls }, document: { querySelectorAll: () => [video] }, flyBuildQualityMenu() {} });
   vm.runInContext(playbackSource, context);
-  assert.equal(vm.runInContext('hlsQualityHeight({height:256,url:["https://cdn.test/144p/index.m3u8"]})', context), 144);
+  assert.equal(vm.runInContext('hlsQualityHeight({height:360,url:["https://cdn.test/360p/index.m3u8"]})', context), 360);
   context.items = [{ id: 'movie', hlsManifestVersion: 2, hlsManifestUrl: 'https://cdn.test/master-v2.m3u8' }];
   vm.runInContext('refreshPublishedSources(items)', context);
   assert.equal(loaded.length, 1);
   assert.equal(hls._flaynityRestore.position, 12);
   assert.equal(hls._flaynityRestore.playing, false);
-  assert.equal(hls._flaynityRestore.quality, 144);
+  assert.equal(hls._flaynityRestore.quality, 360);
   vm.runInContext('refreshPublishedSources(items)', context);
   assert.equal(loaded.length, 1);
 });
 
-test('client waits through queued and processing states before resolving 144p', async () => {
+test('client waits through queued and processing states before resolving 360p', async () => {
   const source = await fs.readFile(new URL('../cloudflare-r2.js', import.meta.url), 'utf8');
-  const states = ['queued', 'processing', 'ready-144p'];
+  const states = ['queued', 'processing', 'ready-360p'];
   const calls = [];
   const user = { uid: 'owner', getIdToken: async () => 'test-token' };
   const context = vm.createContext({ auth: { currentUser: user }, AbortController, console,
     setTimeout(fn, ms) { if (ms < 90000) queueMicrotask(fn); return 0; }, clearTimeout() {},
-    fetch: async url => { calls.push(url); const status = states.shift(); return { ok: true, json: async () => ({ jobId: 'test-job', status, available: status === 'ready-144p' ? ['144p'] : [], hlsUrl: 'https://cdn.test/master.m3u8' }) }; }
+    fetch: async url => { calls.push(url); const status = states.shift(); return { ok: true, json: async () => ({ jobId: 'test-job', status, available: status === 'ready-360p' ? ['360p'] : [], hlsUrl: 'https://cdn.test/master.m3u8' }) }; }
   });
   vm.runInContext(source, context);
   const result = await vm.runInContext('flaynityTranscodeToHls("uploads/feels/test.mp4", "video/mp4", null, {contentId:"movie",type:"video-short"})', context);
-  assert.equal(result.status, 'ready-144p');
+  assert.equal(result.status, 'ready-360p');
   assert.equal(calls.length, 3);
   assert.ok(!calls.some(url => url.endsWith('/published')));
 });
@@ -138,7 +138,7 @@ for (const fixture of [
   { name: 'anamorphic', size: '320x240', sar: '64/45' },
   { name: 'rotated', size: '320x180', rotate: true }
 ]) {
-  test(`FFmpeg retains ${fixture.name} display ratio across 144p and 360p`, { timeout: 90000 }, async () => {
+  test(`FFmpeg retains ${fixture.name} display ratio across 360p and 480p`, { timeout: 90000 }, async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hls-test-'));
     try {
       const input = path.join(root, 'input.mp4');

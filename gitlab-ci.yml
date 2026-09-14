@@ -1,0 +1,14 @@
+hls-pipeline-tests:
+  image: node:22-bookworm-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates
+    - npm install --omit=dev --ignore-scripts
+  script:
+    - node --check index.js
+    - node --check processor/server.js
+    - node --check app.js
+    - node --check cloudflare-r2.js
+    - npm test

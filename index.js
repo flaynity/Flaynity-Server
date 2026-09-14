@@ -165,7 +165,7 @@ export function matchesPublication(record, job, env) {
   return !!record && record.userId === job.ownerId && record.hlsJobId === job.jobId && record.hlsUrl === hlsUrl(env, job.jobId) && ["published", "scheduled"].includes(record.status);
 }
 async function syncPublication(env, job) {
-  if (!job.available?.includes("144p")) return false;
+  if (!job.available?.includes("360p")) return false;
   // Conditional PUT prevents stale callbacks from rolling back newer variants,
   // deleting edits, or resurrecting a post removed during synchronization.
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -216,7 +216,7 @@ async function handleTranscodeStatus(request, env, jobId, confirm = false) {
     const job = await processorRequest(env, `/jobs/${jobId}`);
     if (job.ownerId !== auth.sub) return json({ error: "Job belongs to another user" }, 403, env);
     if (confirm) {
-      if (!job.available?.includes("144p")) return json({ error: "144p is not ready" }, 409, env);
+      if (!job.available?.includes("360p")) return json({ error: "360p is not ready" }, 409, env);
       const result = await reconcileJob(env, job);
       if (!result.published) return json({ error: "Firebase publication is not confirmed" }, 409, env);
       return json(jobResponse(env, result.job), 200, env);

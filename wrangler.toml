@@ -3,6 +3,9 @@ main = "index.js"
 compatibility_date = "2026-09-09"
 workers_dev = true
 
+[triggers]
+crons = ["* * * * *"]
+
 # IMPORTANT: Use the existing Flaynity R2 bucket.
 [[r2_buckets]]
 binding = "MEDIA_BUCKET"

@@ -125,7 +125,7 @@ async function encodeStreaming(root, job, q, onEarlyReady) {
     "-metadata:s:v:0", "rotate=0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000", "-af", "aresample=async=1:first_pts=0",
     "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "event", "-hls_flags", "independent_segments+append_list",
     "-hls_segment_filename", path.join(dir, "seg_%05d.ts"), playlist
-  ], root, { stdio: ["ignore", "pipe", "pipe"] });
+  ], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", d => { stderr = (stderr + d).slice(-12000); });
   let earlyReady = false, uploaded = new Set(), lastPlaylist = "", lastProgress = 0;

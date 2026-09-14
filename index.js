@@ -125,10 +125,30 @@ async function firebaseRequest(env, dbPath, options = {}) {
   return response;
 }
 async function processorRequest(env, route, body) {
-  const response = await fetch(`${String(env.FFMPEG_PROCESSOR_URL).replace(/\/$/, "")}${route}`, { method: body ? "POST" : "GET", headers: { "content-type": "application/json", "x-flaynity-job-token": env.FFMPEG_PROCESSOR_TOKEN }, ...(body ? { body: JSON.stringify(body) } : {}) });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) { const error = new Error(data.error || `Processor request failed (${response.status})`); error.status = response.status; throw error; }
-  return data;
+  const base = String(env.FFMPEG_PROCESSOR_URL || "").replace(/\/$/, "");
+  if (!base) throw new Error("FFMPEG_PROCESSOR_URL is not configured");
+  let lastError;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const response = await fetch(`${base}${route}`, {
+        method: body ? "POST" : "GET",
+        headers: { "content-type": "application/json", "x-flaynity-job-token": env.FFMPEG_PROCESSOR_TOKEN },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(30000)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok) return data;
+      const error = new Error(data.error || `Processor request failed (${response.status})`);
+      error.status = response.status;
+      lastError = error;
+      if (![408, 425, 429, 500, 502, 503, 504].includes(response.status)) throw error;
+    } catch (error) {
+      lastError = error;
+      if (error.status && ![408, 425, 429, 500, 502, 503, 504].includes(error.status)) throw error;
+    }
+    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+  }
+  throw lastError || new Error("Processor request failed");
 }
 export function playbackMetadata(env, job) {
   const master = hlsUrl(env, job.jobId);

@@ -1,0 +1,163 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import vm from 'node:vm';
+import { qualities, sourceGeometry, renditionGeometry, masterPlaylist, processStage, encode, run } from '../processor/server.js';
+import { playbackMetadata, matchesPublication } from '../index.js';
+
+const env = { MEDIA_BASE_URL: 'https://cdn.example.test/media' };
+function makeJob() { return { jobId: 'abc123abc123abc123abc123', ownerId: 'owner', sourceKey: 'uploads/feels/source.mp4', status: 'queued', available: [], renditions: {}, manifestVersion: 0 }; }
+function fakeIO(events, failUpload) {
+  return {
+    prepare: async (_root, job) => { job.source = { width: 1080, height: 1920, aspectRatio: 9 / 16, hasAudio: true }; },
+    encode: async (_root, job, q) => { events.push(`encode:${q.name}`); return renditionGeometry(job.source, q); },
+    upload: async (_dir, prefix) => { events.push(`upload:${prefix.split('/').pop()}`); if (prefix.endsWith(failUpload || '__none__')) throw new Error('upload unavailable'); },
+    put: async (key, body) => { events.push(`put:${key.split('/').pop()}`); assert.ok(body.startsWith('#EXTM3U')); },
+    save: async job => { events.push(`status:${job.status}:${job.available.join(',')}`); },
+    notify: async job => { events.push(`notify:${job.status}`); }
+  };
+}
+
+test('144p is the only pre-publication encode; renditions are advertised after upload', async () => {
+  const events = [], job = makeJob();
+  await processStage(job, false, fakeIO(events));
+  assert.deepEqual(events.filter(e => e.startsWith('encode:')), ['encode:144p']);
+  assert.deepEqual(job.available, ['144p']);
+  assert.equal(job.status, 'ready-144p');
+  assert.ok(events.indexOf('upload:144p') < events.indexOf('put:master-v1.m3u8'));
+  assert.ok(events.indexOf('put:master.m3u8') < events.indexOf('status:ready-144p:144p'));
+  await assert.rejects(processStage(job, true, fakeIO(events)), /publication must be confirmed/);
+  job.publishedAt = Date.now();
+  await processStage(job, true, fakeIO(events));
+  assert.deepEqual(events.filter(e => e.startsWith('encode:')), qualities.map(q => `encode:${q.name}`));
+  assert.equal(job.status, 'ready');
+  assert.equal(job.manifestVersion, 5);
+  assert.deepEqual(job.available, qualities.map(q => q.name));
+});
+
+test('failed background upload keeps published 144p and never advertises failed quality', async () => {
+  const events = [], job = makeJob();
+  await processStage(job, false, fakeIO(events));
+  job.publishedAt = Date.now();
+  await processStage(job, true, fakeIO(events, '360p'));
+  assert.equal(job.status, 'ready-partial');
+  assert.deepEqual(job.available, ['144p']);
+  assert.equal(job.manifestVersion, 1);
+  assert.ok(!events.includes('encode:480p'));
+  assert.ok(!events.includes('put:master-v2.m3u8'));
+});
+
+test('failed first upload is never playable', async () => {
+  const job = makeJob();
+  await processStage(job, false, fakeIO([], '144p'));
+  assert.equal(job.status, 'failed');
+  assert.deepEqual(job.available, []);
+});
+
+test('manifest has real coded resolution and bits/second, not kilobits', () => {
+  const text = masterPlaylist({ '144p': { width: 144, height: 256 } });
+  assert.match(text, /AVERAGE-BANDWIDTH=316000/);
+  assert.match(text, /RESOLUTION=144x256/);
+  assert.ok(!text.includes('360p'));
+  assert.match(masterPlaylist({ '144p': { width: 256, height: 144 } }, false), /AVERAGE-BANDWIDTH=220000/);
+});
+
+test('Firebase metadata exposes only ready renditions and checks matching owner/job/publication', () => {
+  const job = { ...makeJob(), available: ['144p'], manifestVersion: 1, source: { width: 1080, height: 1920, aspectRatio: 9 / 16 } };
+  const metadata = playbackMetadata(env, job);
+  assert.equal(metadata.resolution, '1080x1920');
+  assert.deepEqual(metadata.availableQualities, ['144p']);
+  assert.match(metadata.hlsManifestUrl, /master-v1\.m3u8$/);
+  assert.ok(metadata.videoQualities['144p']);
+  assert.equal(metadata.videoQualities['360p'], undefined);
+  const record = { ...metadata, userId: 'owner', status: 'published' };
+  assert.equal(matchesPublication(record, job, env), true);
+  for (const mismatch of [{ userId: 'other' }, { hlsJobId: 'other' }, { status: 'draft' }, { hlsUrl: 'missing' }]) assert.equal(matchesPublication({ ...record, ...mismatch }, job, env), false);
+  assert.equal(matchesPublication(null, job, env), false);
+});
+
+test('rotation and sample aspect ratio are included in display geometry', () => {
+  const portrait = sourceGeometry({ width: 1920, height: 1080, side_data_list: [{ rotation: 90 }] });
+  assert.ok(Math.abs(portrait.aspectRatio - 9 / 16) < 0.000001);
+  assert.ok(Math.abs(sourceGeometry({ width: 720, height: 576, sample_aspect_ratio: '64:45' }).aspectRatio - 16 / 9) < 0.000001);
+});
+
+const appSource = await fs.readFile(new URL('../app.js', import.meta.url), 'utf8');
+const playbackSource = appSource.slice(appSource.indexOf('const FLAYNITY_STREAM_START_HEIGHT'), appSource.indexOf('function attachSmartAdaptiveSource'));
+test('native HLS WebView starts the published playlist', () => {
+  let played = 0;
+  const item = { id: 'movie', hlsManifestUrl: 'https://cdn.test/master-v1.m3u8' };
+  const video = { style: { setProperty() {} }, canPlayType: () => 'probably', load() {}, play: () => { played++; return Promise.resolve(); } };
+  const context = vm.createContext({ currentActiveMovie: item, hlsInstances: {}, normalizeFlaynityMediaUrl: url => url, flyBuildQualityMenu() {} });
+  vm.runInContext(playbackSource + appSource.slice(appSource.indexOf('function attachSmartAdaptiveSource'), appSource.indexOf('function flySetQualityLoading')), context);
+  context.video = video;
+  vm.runInContext('attachSmartAdaptiveSource(video, "https://cdn.test/master.m3u8", "fly_main")', context);
+  assert.equal(video.src, item.hlsManifestUrl);
+  assert.equal(played, 1);
+});
+test('quality labels use rendition names for portrait HLS and preserve manual choice on refresh', () => {
+  const loaded = [];
+  const hls = { levels: [{ height: 256, url: ['https://cdn.test/144p/index.m3u8'] }, { height: 640, url: ['https://cdn.test/360p/index.m3u8'] }], autoLevelEnabled: false, loadLevel: 0, loadSource: url => loaded.push(url) };
+  const video = { id: 'fly-video', _flaynityContentId: 'movie', _flaynityItem: { hlsManifestVersion: 1 }, currentTime: 12, paused: true, muted: true, playbackRate: 1.5 };
+  const context = vm.createContext({ currentActiveMovie: null, hlsInstances: { fly_main: hls }, document: { querySelectorAll: () => [video] }, flyBuildQualityMenu() {} });
+  vm.runInContext(playbackSource, context);
+  assert.equal(vm.runInContext('hlsQualityHeight({height:256,url:["https://cdn.test/144p/index.m3u8"]})', context), 144);
+  context.items = [{ id: 'movie', hlsManifestVersion: 2, hlsManifestUrl: 'https://cdn.test/master-v2.m3u8' }];
+  vm.runInContext('refreshPublishedSources(items)', context);
+  assert.equal(loaded.length, 1);
+  assert.equal(hls._flaynityRestore.position, 12);
+  assert.equal(hls._flaynityRestore.playing, false);
+  assert.equal(hls._flaynityRestore.quality, 144);
+  vm.runInContext('refreshPublishedSources(items)', context);
+  assert.equal(loaded.length, 1);
+});
+
+test('client waits through queued and processing states before resolving 144p', async () => {
+  const source = await fs.readFile(new URL('../cloudflare-r2.js', import.meta.url), 'utf8');
+  const states = ['queued', 'processing', 'ready-144p'];
+  const calls = [];
+  const user = { uid: 'owner', getIdToken: async () => 'test-token' };
+  const context = vm.createContext({ auth: { currentUser: user }, AbortController, console,
+    setTimeout(fn, ms) { if (ms < 90000) queueMicrotask(fn); return 0; }, clearTimeout() {},
+    fetch: async url => { calls.push(url); const status = states.shift(); return { ok: true, json: async () => ({ jobId: 'test-job', status, available: status === 'ready-144p' ? ['144p'] : [], hlsUrl: 'https://cdn.test/master.m3u8' }) }; }
+  });
+  vm.runInContext(source, context);
+  const result = await vm.runInContext('flaynityTranscodeToHls("uploads/feels/test.mp4", "video/mp4", null, {contentId:"movie",type:"video-short"})', context);
+  assert.equal(result.status, 'ready-144p');
+  assert.equal(calls.length, 3);
+  assert.ok(!calls.some(url => url.endsWith('/published')));
+});
+
+for (const fixture of [
+  { name: 'landscape', size: '320x180' },
+  { name: 'portrait', size: '180x320' },
+  { name: 'square', size: '240x240' },
+  { name: 'four-three', size: '320x240', audio: true },
+  { name: 'anamorphic', size: '320x240', sar: '64/45' },
+  { name: 'rotated', size: '320x180', rotate: true }
+]) {
+  test(`FFmpeg retains ${fixture.name} display ratio across 144p and 360p`, { timeout: 90000 }, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'hls-test-'));
+    try {
+      const input = path.join(root, 'input.mp4');
+      await run('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', `color=c=blue:s=${fixture.size}:r=24`, ...(fixture.audio ? ['-f', 'lavfi', '-i', 'sine=frequency=1000:sample_rate=48000'] : []), '-t', '0.5', '-vf', `setsar=${fixture.sar || '1'}`, '-c:v', 'libx264', '-threads', '1', '-pix_fmt', 'yuv420p', ...(fixture.audio ? ['-c:a', 'aac'] : ['-an']), input], root);
+      if (fixture.rotate) await run('ffmpeg', ['-y', '-v', 'error', '-i', input, '-c', 'copy', '-metadata:s:v:0', 'rotate=90', '-f', 'mp4', path.join(root, 'source')], root);
+      else await fs.rename(input, path.join(root, 'source'));
+      const probe = JSON.parse(await run('ffprobe', ['-v', 'error', '-show_streams', '-of', 'json', path.join(root, 'source')], root));
+      const geometry = sourceGeometry(probe.streams.find(s => s.codec_type === 'video'));
+      const job = { source: geometry };
+      for (const q of qualities.slice(0, 2)) {
+        const size = await encode(root, job, q);
+        const result = JSON.parse(await run('ffprobe', ['-v', 'error', '-show_streams', '-of', 'json', path.join(root, q.name, 'index.m3u8')], root));
+        const stream = result.streams.find(s => s.codec_type === 'video');
+        assert.equal(stream.width, size.width);
+        assert.equal(stream.height, size.height);
+        const actual = sourceGeometry(stream).aspectRatio;
+        assert.ok(Math.abs(actual - geometry.aspectRatio) / geometry.aspectRatio < 0.001, `${actual} vs ${geometry.aspectRatio}`);
+        assert.equal(result.streams.some(s => s.codec_type === 'audio'), !!fixture.audio);
+      }
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+}

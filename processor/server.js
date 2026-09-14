@@ -10,7 +10,11 @@ import { fileURLToPath } from "node:url";
 import { AwsClient } from "aws4fetch";
 
 const jobs = new Map();
-const running = new Set();
+// Render Free/low-memory instances must never run multiple FFmpeg encodes at
+// the same time. Queue initial and background jobs globally.
+const queued = new Set();
+let activeJobId = null;
+const queue = [];
 export const qualities = [
   { name: "144p", width: 256, height: 144, videoBitrate: "220k", maxrate: "280k", bufsize: "440k" },
   { name: "360p", width: 640, height: 360, videoBitrate: "650k", maxrate: "800k", bufsize: "1300k" },
@@ -110,9 +114,11 @@ async function prepare(root, job) {
 export async function encode(root, job, q) {
   const size = renditionGeometry(job.source, q);
   await fs.mkdir(path.join(root, q.name), { recursive: true });
-  // Preserve exact display aspect using SAR after rounding coded sizes to even
-  // integers. Do not force every upload into 16:9 or discard anamorphic DAR.
-  const filter = `scale=${size.width}:${size.height},setsar=${job.source.aspectRatio}*${size.height}/${size.width}:max=10000,fps=24,setpts=PTS-STARTPTS`;
+  // The rendition dimensions are already calculated from the source display
+  // aspect ratio. Encode with square pixels (SAR 1:1) so HLS.js/native players
+  // see the real coded width/height instead of relying on a non-square SAR.
+  // This preserves arbitrary portrait, landscape and square uploads.
+  const filter = `scale=${size.width}:${size.height}:force_original_aspect_ratio=disable,setsar=1,fps=24,setpts=PTS-STARTPTS`;
   await run("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", "-i", path.join(root, "source"), "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-vf", filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-profile:v", "main", "-b:v", q.videoBitrate, "-maxrate", q.maxrate, "-bufsize", q.bufsize, "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)", "-metadata:s:v:0", "rotate=0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000", "-af", "aresample=async=1:first_pts=0", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_flags", "independent_segments", "-hls_segment_filename", path.join(root, q.name, "seg_%05d.ts"), path.join(root, q.name, "index.m3u8")], root);
   return size;
 }
@@ -168,12 +174,29 @@ export async function processStage(job, background = false, io = defaultIO) {
   return job;
 }
 function kick(job, background) {
-  if (running.has(job.jobId)) return;
-  running.add(job.jobId);
-  processStage(job, background).catch(e => { console.error("Job persistence error", job.jobId, e.message); }).finally(() => {
-    running.delete(job.jobId);
-    if (!background && job.publishedAt && job.status === "ready-144p") kick(job, true);
-  });
+  const key = `${job.jobId}:${background ? "background" : "initial"}`;
+  if (activeJobId === job.jobId || queued.has(key)) return;
+  queued.add(key);
+  queue.push({ job, background, key });
+  pumpQueue();
+}
+
+async function pumpQueue() {
+  if (activeJobId || !queue.length) return;
+  const item = queue.shift();
+  queued.delete(item.key);
+  activeJobId = item.job.jobId;
+  try {
+    await processStage(item.job, item.background);
+  } catch (e) {
+    console.error("Job persistence error", item.job.jobId, e.message);
+  } finally {
+    activeJobId = null;
+    if (!item.background && item.job.publishedAt && item.job.status === "ready-144p") {
+      kick(item.job, true);
+    }
+    void pumpQueue();
+  }
 }
 export const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") return json(res, 200, { ok: true, service: "flaynity-ffmpeg-processor", ffmpeg: true });

@@ -13,8 +13,12 @@ const jobs = new Map();
 // Render Free/low-memory instances must never run multiple FFmpeg encodes at
 // the same time. Queue initial and background jobs globally.
 const queued = new Set();
-let activeJobId = null;
+const activeInitialJobs = new Set();
+const activeBackgroundJobs = new Set();
+const active360Processes = new Set();
 const queue = [];
+const MAX_INITIAL_CONCURRENCY = 2;
+
 export const qualities = [
   { name: "360p", width: 640, height: 360, videoBitrate: "650k", maxrate: "800k", bufsize: "1300k" },
   { name: "480p", width: 854, height: 480, videoBitrate: "1100k", maxrate: "1350k", bufsize: "2200k" },
@@ -134,6 +138,7 @@ async function encode360Early(root, job, io = defaultIO) {
     "-af", "aresample=async=1:first_pts=0", "-f", "hls", "-hls_time", "2",
     "-hls_playlist_type", "event", "-hls_flags", "independent_segments",
     "-hls_segment_filename", segmentPath, playlist];
+  active360Processes.add(job.jobId);
   const child = spawn("ffmpeg", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", d => { stderr = (stderr + d).slice(-12000); });
@@ -188,6 +193,7 @@ async function encode360Early(root, job, io = defaultIO) {
     void (async () => {
       const code = await new Promise(resolve => child.on("close", resolve));
       clearInterval(watcher);
+      active360Processes.delete(job.jobId);
       try {
         if (code !== 0) throw new Error(`360p FFmpeg exited ${code}${stderr ? `: ${stderr.slice(-1500)}` : ""}`);
         await uploadNew();
@@ -214,6 +220,7 @@ async function encode360Early(root, job, io = defaultIO) {
     return { early: true, size };
   } catch (e) {
     clearInterval(watcher);
+    active360Processes.delete(job.jobId);
     try { child.kill("SIGKILL"); } catch {}
     throw e;
   }
@@ -226,7 +233,7 @@ export async function encode(root, job, q) {
   // see the real coded width/height instead of relying on a non-square SAR.
   // This preserves arbitrary portrait, landscape and square uploads.
   const filter = `scale=${size.width}:${size.height}:force_original_aspect_ratio=disable,setsar=1,fps=24,setpts=PTS-STARTPTS`;
-  await run("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", "-i", path.join(root, "source"), "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-vf", filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", q.name === "360p" ? "ultrafast" : "veryfast", "-threads", "2", "-profile:v", "main", "-b:v", q.videoBitrate, "-maxrate", q.maxrate, "-bufsize", q.bufsize, "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)", "-metadata:s:v:0", "rotate=0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000", "-af", "aresample=async=1:first_pts=0", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_flags", "independent_segments", "-hls_segment_filename", path.join(root, q.name, "seg_%05d.ts"), path.join(root, q.name, "index.m3u8")], root);
+  await run("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", "-i", job.sourceUrl || path.join(root, "source"), "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-vf", filter, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", q.name === "360p" ? "ultrafast" : "veryfast", "-threads", "2", "-profile:v", "main", "-b:v", q.videoBitrate, "-maxrate", q.maxrate, "-bufsize", q.bufsize, "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)", "-metadata:s:v:0", "rotate=0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000", "-af", "aresample=async=1:first_pts=0", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_flags", "independent_segments", "-hls_segment_filename", path.join(root, q.name, "seg_%05d.ts"), path.join(root, q.name, "index.m3u8")], root);
   return size;
 }
 async function notify(job) {
@@ -286,29 +293,46 @@ export async function processStage(job, background = false, io = defaultIO) {
 }
 function kick(job, background) {
   const key = `${job.jobId}:${background ? "background" : "initial"}`;
-  if (activeJobId === job.jobId || queued.has(key)) return;
+  if (queued.has(key) || (background ? activeBackgroundJobs.has(job.jobId) : activeInitialJobs.has(job.jobId))) return;
   queued.add(key);
-  queue.push({ job, background, key });
-  pumpQueue();
+  // Initial 360p jobs always have priority over background quality jobs.
+  if (background) queue.push({ job, background, key });
+  else queue.unshift({ job, background, key });
+  void pumpQueue();
 }
 
 async function pumpQueue() {
-  if (activeJobId || !queue.length) return;
-  const item = queue.shift();
-  queued.delete(item.key);
-  activeJobId = item.job.jobId;
-  try {
-    await processStage(item.job, item.background);
-  } catch (e) {
-    console.error("Job persistence error", item.job.jobId, e.message);
-  } finally {
-    activeJobId = null;
-    if (!item.background && item.job.publishedAt && item.job.status === "ready-360p") {
-      kick(item.job, true);
+  // Start as many initial 360p encodes as the Render instance can reasonably
+  // handle. Background qualities never consume an initial-upload slot.
+  while (activeInitialJobs.size < MAX_INITIAL_CONCURRENCY) {
+    const index = queue.findIndex(item => !item.background);
+    if (index < 0) break;
+    const item = queue.splice(index, 1)[0];
+    queued.delete(item.key);
+    activeInitialJobs.add(item.job.jobId);
+    void processStage(item.job, false).catch(e => console.error("Initial job error", item.job.jobId, e.message)).finally(() => {
+      activeInitialJobs.delete(item.job.jobId);
+      void pumpQueue();
+    });
+  }
+
+  // Never let background encoding compete with a live 360p encoder. This is
+  // what keeps a second upload moving while the first long video is still
+  // producing its progressive 360p segments.
+  if (activeInitialJobs.size === 0 && active360Processes.size === 0 && activeBackgroundJobs.size === 0) {
+    const index = queue.findIndex(item => item.background);
+    if (index >= 0) {
+      const item = queue.splice(index, 1)[0];
+      queued.delete(item.key);
+      activeBackgroundJobs.add(item.job.jobId);
+      void processStage(item.job, true).catch(e => console.error("Background job error", item.job.jobId, e.message)).finally(() => {
+        activeBackgroundJobs.delete(item.job.jobId);
+        void pumpQueue();
+      });
     }
-    void pumpQueue();
   }
 }
+
 export const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") return json(res, 200, { ok: true, service: "flaynity-ffmpeg-processor", ffmpeg: true });
   if (!authorized(req)) return json(res, 401, { error: "Unauthorized processor request" });

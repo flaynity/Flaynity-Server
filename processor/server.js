@@ -77,7 +77,7 @@ async function s3Request(key, options = {}) {
   return client.fetch(`https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${bucket}/${key}`, options);
 }
 async function s3Put(key, body, contentType) {
-  const mutable = key.endsWith("/master.m3u8") || key.startsWith("internal/");
+  const mutable = key.endsWith(".m3u8") || key.startsWith("internal/");
   const response = await s3Request(key, { method: "PUT", headers: { "Content-Type": contentType, "Cache-Control": mutable ? "no-store" : "public, max-age=31536000, immutable" }, body });
   if (!response.ok) throw new Error(`R2 upload failed (${response.status})`);
 }

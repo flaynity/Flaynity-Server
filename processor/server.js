@@ -102,13 +102,121 @@ async function uploadTree(dir, prefix) {
   }
 }
 async function prepare(root, job) {
-  const response = await fetch(job.sourceUrl);
-  if (!response.ok || !response.body) throw new Error(`Source download failed (${response.status})`);
-  await pipeline(Readable.fromWeb(response.body), createWriteStream(path.join(root, "source")));
-  const info = JSON.parse(await run("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", path.join(root, "source")], root));
+  // Do not download the entire long video before FFmpeg starts. Probe the
+  // signed R2 source directly so encoding can begin immediately.
+  const info = JSON.parse(await run("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", job.sourceUrl], root));
   const stream = info.streams.find(s => s.codec_type === "video");
   if (!stream) throw new Error("Source has no video stream");
   job.source = { ...sourceGeometry(stream), duration: Number(info.format?.duration) || 0, hasAudio: info.streams.some(s => s.codec_type === "audio") };
+}
+async function waitForFile(file, timeout = 30000) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    try { await fs.access(file); return true; } catch {}
+    await sleep(150);
+  }
+  return false;
+}
+async function encode360Early(root, job, io = defaultIO) {
+  const q = qualities[0];
+  const size = renditionGeometry(job.source, q);
+  const dir = path.join(root, q.name);
+  await fs.mkdir(dir, { recursive: true });
+  const filter = `scale=${size.width}:${size.height}:force_original_aspect_ratio=disable,setsar=1,fps=24,setpts=PTS-STARTPTS`;
+  const playlist = path.join(dir, "index.m3u8");
+  const segmentPath = path.join(dir, "seg_%05d.ts");
+  const args = ["-y", "-hide_banner", "-loglevel", "warning", "-i", job.sourceUrl,
+    "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-vf", filter,
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-threads", "2",
+    "-profile:v", "main", "-b:v", q.videoBitrate, "-maxrate", q.maxrate, "-bufsize", q.bufsize,
+    "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
+    "-metadata:s:v:0", "rotate=0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000",
+    "-af", "aresample=async=1:first_pts=0", "-f", "hls", "-hls_time", "2",
+    "-hls_playlist_type", "event", "-hls_flags", "independent_segments",
+    "-hls_segment_filename", segmentPath, playlist];
+  const child = spawn("ffmpeg", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", d => { stderr = (stderr + d).slice(-12000); });
+  const prefix = `uploads/hls/${job.jobId}`;
+  let uploaded = new Set();
+  let published = false;
+  let lastPlaylist = "";
+  const uploadNew = async () => {
+    let entries = [];
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries.filter(x => x.isFile() && x.name.endsWith(".ts")).sort((a,b) => a.name.localeCompare(b.name))) {
+      if (uploaded.has(e.name)) continue;
+      await io.put(`${prefix}/${q.name}/${e.name}`, await fs.readFile(path.join(dir, e.name)), "video/mp2t");
+      uploaded.add(e.name);
+    }
+    try {
+      const text = await fs.readFile(playlist, "utf8");
+      if (text && text !== lastPlaylist) {
+        await io.put(`${prefix}/${q.name}/index.m3u8`, text, "application/vnd.apple.mpegurl");
+        lastPlaylist = text;
+      }
+    } catch {}
+  };
+  const watcher = setInterval(() => { void uploadNew().catch(e => console.error("Early HLS upload", e.message)); }, 350);
+  try {
+    const firstReady = await (async () => {
+      const started = Date.now();
+      while (Date.now() - started < 120000) {
+        await uploadNew();
+        if (uploaded.size >= 2 && lastPlaylist) return true;
+        if (child.exitCode !== null) break;
+        await sleep(200);
+      }
+      return uploaded.size >= 1 && !!lastPlaylist;
+    })();
+    if (!firstReady) throw new Error(`360p early HLS failed${stderr ? `: ${stderr.slice(-1500)}` : ""}`);
+    const manifest = masterPlaylist({ "360p": size }, job.source.hasAudio);
+    await io.put(`${prefix}/master-v1.m3u8`, manifest, "application/vnd.apple.mpegurl");
+    await io.put(`${prefix}/master.m3u8`, manifest, "application/vnd.apple.mpegurl");
+    job.renditions = { "360p": size };
+    job.available = ["360p"];
+    job.manifestVersion = 1;
+    job.progress = Math.round(100 / qualities.length);
+    job.currentQuality = null;
+    job.status = "ready-360p";
+    await io.save(job);
+    await io.notify(job);
+    published = true;
+    // Keep FFmpeg alive and keep uploading newly-created segments in the
+    // background. processStage returns now, allowing Firebase publication and
+    // the remaining quality queue to start without waiting for the long video.
+    void (async () => {
+      const code = await new Promise(resolve => child.on("close", resolve));
+      clearInterval(watcher);
+      try {
+        if (code !== 0) throw new Error(`360p FFmpeg exited ${code}${stderr ? `: ${stderr.slice(-1500)}` : ""}`);
+        await uploadNew();
+        const finalManifest = await fs.readFile(playlist, "utf8");
+        await io.put(`${prefix}/${q.name}/index.m3u8`, finalManifest, "application/vnd.apple.mpegurl");
+        // Final master is still the same 360p manifest; later background jobs
+        // will publish master-v2/v3/v4 as each higher quality completes.
+        job.renditions = { "360p": size };
+        job.available = ["360p"];
+        job.status = job.publishedAt ? "processing-background" : "ready-360p";
+        job.currentQuality = null;
+        await io.save(job);
+        if (job.publishedAt) void pumpQueue();
+      } catch (e) {
+        job.status = "ready-partial";
+        job.error = e.message || String(e);
+        job.currentQuality = null;
+        await io.save(job);
+        await io.notify(job);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+      }
+    })();
+    return { early: true, size };
+  } catch (e) {
+    clearInterval(watcher);
+    try { child.kill("SIGKILL"); } catch {}
+    throw e;
+  }
 }
 export async function encode(root, job, q) {
   const size = renditionGeometry(job.source, q);
@@ -138,10 +246,15 @@ const defaultIO = { prepare, encode, upload: uploadTree, put: s3Put, save: saveJ
 export async function processStage(job, background = false, io = defaultIO) {
   if (background && (!job.publishedAt || !job.available.includes("360p"))) throw new Error("Firebase publication must be confirmed before background encoding");
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "flaynity-"));
+  let detached = false;
   try {
     job.status = background ? "processing-background" : "processing";
     delete job.error;
     await io.prepare(root, job);
+    if (!background && !job.available.includes("360p")) {
+      const early = await encode360Early(root, job, io);
+      if (early?.early) { detached = true; return job; }
+    }
     const ladder = background ? qualities.slice(1) : qualities.slice(0, 1);
     for (const q of ladder) {
       if (job.available.includes(q.name)) continue;
@@ -155,7 +268,6 @@ export async function processStage(job, background = false, io = defaultIO) {
       const version = Object.keys(next).length;
       await io.put(`${prefix}/master-v${version}.m3u8`, manifest, "application/vnd.apple.mpegurl");
       await io.put(`${prefix}/master.m3u8`, manifest, "application/vnd.apple.mpegurl");
-      // Only advertise a quality after BOTH playlists and all segments exist.
       job.renditions = next; job.available = qualities.filter(q => next[q.name]).map(q => q.name);
       job.manifestVersion = version; job.progress = Math.round(version / qualities.length * 100);
       job.currentQuality = null;
@@ -169,7 +281,7 @@ export async function processStage(job, background = false, io = defaultIO) {
     job.error = e.message || String(e); job.currentQuality = null;
     await io.save(job);
     await io.notify(job);
-  } finally { await fs.rm(root, { recursive: true, force: true }).catch(() => {}); }
+  } finally { if (!detached) await fs.rm(root, { recursive: true, force: true }).catch(() => {}); }
   return job;
 }
 function kick(job, background) {

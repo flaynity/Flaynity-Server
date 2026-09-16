@@ -3,10 +3,8 @@ import { AwsClient } from "aws4fetch";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const MAX_UPLOAD_EXPIRY = 900;
 const HLS_PREFIX = "uploads/hls/";
+const DEFAULT_FFMPEG_PROCESSOR_URL = "https://flaynity-video-processor.onrender.com";
 const ALLOWED_HLS_TYPES = new Set(["video/mp4", "video/webm", "video/quicktime", "video/x-matroska"]);
-const MUX_API_BASE = "https://api.mux.com";
-const MUX_UPLOAD_PREFIX = "internal/mux/uploads/";
-const MUX_WEBHOOK_TOLERANCE_SECONDS = 300;
 
 function corsHeaders(env) {
   return {
@@ -96,284 +94,15 @@ async function handleUploadUrl(request, env) {
   try { const uploadUrl = await createPresignedPut(env, key, contentType); const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`; return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env); }
   catch (e) { return json({ error: e?.message || "Could not create upload URL" }, 500, env); }
 }
-
-function requireMuxConfig(env) {
-  if (!env.MUX_TOKEN_ID || !env.MUX_TOKEN_SECRET) throw new Error("Configure MUX_TOKEN_ID and MUX_TOKEN_SECRET");
-}
-function muxBasicAuth(env) {
-  return `Basic ${btoa(`${env.MUX_TOKEN_ID}:${env.MUX_TOKEN_SECRET}`)}`;
-}
-async function muxRequest(env, path, options = {}) {
-  requireMuxConfig(env);
-  const response = await fetch(`${MUX_API_BASE}${path}`, {
-    ...options,
-    headers: {
-      "Authorization": muxBasicAuth(env),
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    }
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(data?.error?.messages?.[0] || data?.error?.message || data?.message || `Mux API request failed (${response.status})`);
-    error.status = response.status;
-    throw error;
-  }
-  return data;
-}
-function muxSafeId(value, max = 128) {
-  const id = String(value || "").trim();
-  return id && id.length <= max ? id : null;
-}
-function muxPublicationPath(type, contentId) {
-  return `admin_panel/movies/${type === "video-short" ? "feels" : "user_uploads"}/${contentId}`;
-}
-function muxPlaybackUrl(playbackId) {
-  return playbackId ? `https://stream.mux.com/${encodeURIComponent(playbackId)}.m3u8` : "";
-}
-async function muxWebhookSignatureValid(rawBody, signatureHeader, secret) {
-  if (!signatureHeader || !secret) return false;
-  const parts = {};
-  for (const part of String(signatureHeader).split(",")) {
-    const index = part.indexOf("=");
-    if (index > 0) parts[part.slice(0, index).trim()] = part.slice(index + 1).trim();
-  }
-  const timestamp = Number(parts.t);
-  const provided = String(parts.v1 || "").toLowerCase();
-  if (!Number.isFinite(timestamp) || !/^[0-9a-f]{64}$/.test(provided)) return false;
-  if (Math.abs(Math.floor(Date.now() / 1000) - timestamp) > MUX_WEBHOOK_TOLERANCE_SECONDS) return false;
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${timestamp}.${rawBody}`)));
-  const expected = Array.from(digest, n => n.toString(16).padStart(2, "0")).join("");
-  if (expected.length !== provided.length) return false;
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ provided.charCodeAt(i);
-  return diff === 0;
-}
-async function handleMuxCreateUpload(request, env) {
-  let auth;
-  try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
-  let body;
-  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400, env); }
-  const type = String(body.type || "").trim();
-  const contentId = muxSafeId(body.contentId, 120);
-  const contentType = String(body.contentType || "video/mp4").split(";")[0].toLowerCase();
-  if (!["video-short", "video-long"].includes(type) || !/^[a-zA-Z0-9_-]{1,120}$/.test(contentId || "")) return json({ error: "Invalid video type or content ID" }, 400, env);
-  if (!ALLOWED_HLS_TYPES.has(contentType)) return json({ error: "Unsupported video content type" }, 400, env);
-  try {
-    requireMuxConfig(env);
-    const token = crypto.randomUUID().replace(/-/g, "");
-    const publicationPath = muxPublicationPath(type, contentId);
-    const title = String(body.title || "").trim().slice(0, 512);
-    const payload = {
-      cors_origin: env.APP_ORIGIN || "https://flaynity.indevs.in",
-      timeout: Math.min(Math.max(Number(body.timeout || 604800), 60), 604800),
-      new_asset_settings: {
-        playback_policies: ["public"],
-        video_quality: "basic",
-        max_resolution_tier: "1080p",
-        passthrough: token,
-        ...(title ? { meta: { title } } : {})
-      }
-    };
-    const result = await muxRequest(env, "/video/v1/uploads", { method: "POST", body: JSON.stringify(payload) });
-    const upload = result?.data;
-    if (!upload?.id || !upload?.url) throw new Error("Mux did not return a direct upload URL");
-    const record = {
-      uploadId: upload.id,
-      ownerId: auth.sub,
-      contentId,
-      type,
-      publicationPath,
-      passthrough: token,
-      status: upload.status || "waiting",
-      assetId: upload.asset_id || "",
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    };
-    const recordJson = JSON.stringify(record);
-    await env.MEDIA_BUCKET.put(`${MUX_UPLOAD_PREFIX}${token}.json`, recordJson, { httpMetadata: { contentType: "application/json" } });
-    await env.MEDIA_BUCKET.put(`${MUX_UPLOAD_PREFIX}by-upload/${upload.id}.json`, recordJson, { httpMetadata: { contentType: "application/json" } });
-    return json({
-      provider: "mux",
-      uploadId: upload.id,
-      uploadUrl: upload.url,
-      timeout: upload.timeout || payload.timeout,
-      status: upload.status || "waiting",
-      contentId,
-      type
-    }, 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not create Mux upload" }, e.status === 401 || e.status === 403 ? 502 : 503, env);
-  }
-}
-async function handleMuxUploadStatus(request, env, uploadId) {
-  let auth;
-  try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
-  if (!/^[a-zA-Z0-9_-]{10,200}$/.test(uploadId || "")) return json({ error: "Invalid upload ID" }, 400, env);
-  try {
-    const result = await muxRequest(env, `/video/v1/uploads/${encodeURIComponent(uploadId)}`);
-    const upload = result?.data;
-    if (!upload) return json({ error: "Mux upload not found" }, 404, env);
-    const stored = await env.MEDIA_BUCKET.get(`${MUX_UPLOAD_PREFIX}by-upload/${uploadId}.json`);
-    const record = stored ? await stored.json().catch(() => null) : null;
-    if (record && record.ownerId !== auth.sub) return json({ error: "Upload belongs to another user" }, 403, env);
-    const playbackId = "";
-    return json({
-      provider: "mux",
-      uploadId: upload.id,
-      status: upload.status,
-      assetId: upload.asset_id || record?.assetId || "",
-      error: upload.error || null,
-      contentId: record?.contentId || "",
-      type: record?.type || "",
-      publicationPath: record?.publicationPath || "",
-      playbackId,
-      hlsUrl: ""
-    }, 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not read Mux upload status" }, e.status === 404 ? 404 : 503, env);
-  }
-}
-async function handleMuxCancelUpload(request, env, uploadId) {
-  let auth;
-  try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
-  if (!/^[a-zA-Z0-9_-]{10,200}$/.test(uploadId || "")) return json({ error: "Invalid upload ID" }, 400, env);
-  try {
-    const stored = await env.MEDIA_BUCKET.get(`${MUX_UPLOAD_PREFIX}by-upload/${uploadId}.json`);
-    const record = stored ? await stored.json().catch(() => null) : null;
-    if (record && record.ownerId !== auth.sub) return json({ error: "Upload belongs to another user" }, 403, env);
-    const result = await muxRequest(env, `/video/v1/uploads/${encodeURIComponent(uploadId)}/cancel`, { method: "PUT", body: "{}" });
-    if (record) {
-      record.status = result?.data?.status || "cancelled";
-      record.updatedAt = Date.now();
-      const recordJson = JSON.stringify(record);
-      await env.MEDIA_BUCKET.put(`${MUX_UPLOAD_PREFIX}${record.passthrough}.json`, recordJson, { httpMetadata: { contentType: "application/json" } });
-      await env.MEDIA_BUCKET.put(`${MUX_UPLOAD_PREFIX}by-upload/${uploadId}.json`, recordJson, { httpMetadata: { contentType: "application/json" } });
-    }
-    return json({ provider: "mux", uploadId, status: result?.data?.status || "cancelled" }, 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not cancel Mux upload" }, e.status === 404 ? 404 : 503, env);
-  }
-}
-async function handleMuxWebhook(request, env) {
-  if (!env.MUX_WEBHOOK_SECRET) return json({ error: "MUX_WEBHOOK_SECRET is not configured" }, 503, env);
-  const rawBody = await request.text();
-  if (!await muxWebhookSignatureValid(rawBody, request.headers.get("mux-signature"), env.MUX_WEBHOOK_SECRET)) return unauthorized(env, "Invalid Mux webhook signature");
-  let event;
-  try { event = JSON.parse(rawBody); } catch { return json({ error: "Invalid webhook JSON" }, 400, env); }
-  const type = String(event?.type || "");
-  const data = event?.data || {};
-  const passthrough = muxSafeId(data?.passthrough, 128);
-  if (!passthrough) return json({ ok: true, ignored: true }, 200, env);
-  const objectKey = `${MUX_UPLOAD_PREFIX}${passthrough}.json`;
-  const stored = await env.MEDIA_BUCKET.get(objectKey);
-  if (!stored) return json({ ok: true, ignored: true }, 200, env);
-  const record = await stored.json();
-  if (["video.upload.asset_created", "video.asset.ready", "video.asset.errored", "video.upload.cancelled"].includes(type)) {
-    record.updatedAt = Date.now();
-    if (type === "video.upload.asset_created") {
-      record.status = "asset_created";
-      record.assetId = data?.asset_id || record.assetId || "";
-      // Mux may expose playback_ids as soon as the asset is created. Keep the
-      // ID in the server record, but do not mark the asset playable until the
-      // video.asset.ready webhook arrives.
-      const playback = Array.isArray(data?.playback_ids) ? data.playback_ids.find(item => item?.policy === "public") || data.playback_ids[0] : null;
-      if (playback?.id) {
-        record.playbackId = playback.id;
-        record.hlsUrl = muxPlaybackUrl(playback.id);
-      }
-    } else if (type === "video.asset.ready") {
-      record.status = "ready";
-      record.assetId = data?.id || record.assetId || "";
-      const playback = Array.isArray(data?.playback_ids) ? data.playback_ids.find(item => item?.policy === "public") || data.playback_ids[0] : null;
-      record.playbackId = playback?.id || record.playbackId || "";
-      record.hlsUrl = muxPlaybackUrl(record.playbackId);
-      record.duration = Number(data?.duration || 0);
-      record.aspectRatio = data?.aspect_ratio || "";
-      record.sourceWidth = Number(data?.max_stored_resolution ? (data?.tracks?.find(t => t.type === "video")?.max_width || 0) : 0);
-      record.sourceHeight = Number(data?.max_stored_resolution ? (data?.tracks?.find(t => t.type === "video")?.max_height || 0) : 0);
-      try {
-        const response = await firebaseRequest(env, record.publicationPath, { headers: { "X-Firebase-ETag": "true" } });
-        const publication = await response.json();
-        if (publication && publication.userId === record.ownerId && ["published", "scheduled"].includes(publication.status)) {
-          await firebaseRequest(env, record.publicationPath, {
-            method: "PUT",
-            headers: { "if-match": response.headers.get("etag") },
-            body: JSON.stringify({
-              ...publication,
-              videoProvider: "mux",
-              videoLink: record.hlsUrl,
-              videoUrl: record.hlsUrl,
-              hlsUrl: record.hlsUrl,
-              hlsManifestUrl: record.hlsUrl,
-              hlsManifestVersion: Date.now(),
-              muxUploadId: record.uploadId,
-              muxAssetId: record.assetId,
-              muxPlaybackId: record.playbackId,
-              hlsStatus: "ready",
-              hlsError: "",
-              availableQualities: ["360p", "480p", "720p", "1080p"],
-              streamQualityLadder: [360, 480, 720, 1080],
-              videoQualities: { auto: record.hlsUrl, hls: record.hlsUrl, preferred: [360, 480, 720, 1080] },
-              duration: record.duration || publication.duration || 0,
-              aspectRatio: record.aspectRatio || publication.aspectRatio || "",
-              sourceWidth: record.sourceWidth || publication.sourceWidth || 0,
-              sourceHeight: record.sourceHeight || publication.sourceHeight || 0,
-              updateTime: Date.now()
-            })
-          });
-          record.firebasePublished = true;
-        }
-      } catch (e) {
-        console.error("Mux webhook Firebase sync failed", e.message);
-      }
-    } else if (type === "video.asset.errored") {
-      record.status = "errored";
-      record.error = data?.errors || data?.error || "Mux asset processing failed";
-    } else if (type === "video.upload.cancelled") {
-      record.status = "cancelled";
-    }
-    const recordJson = JSON.stringify(record);
-    await env.MEDIA_BUCKET.put(objectKey, recordJson, { httpMetadata: { contentType: "application/json" } });
-    if (record.uploadId) await env.MEDIA_BUCKET.put(`${MUX_UPLOAD_PREFIX}by-upload/${record.uploadId}.json`, recordJson, { httpMetadata: { contentType: "application/json" } });
-  }
-  return json({ ok: true }, 200, env);
-}
-async function handleMuxAssetStatus(request, env, assetId) {
-  let auth;
-  try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
-  if (!/^[a-zA-Z0-9_-]{10,200}$/.test(assetId || "")) return json({ error: "Invalid asset ID" }, 400, env);
-  try {
-    const result = await muxRequest(env, `/video/v1/assets/${encodeURIComponent(assetId)}`);
-    const asset = result?.data;
-    const recordList = await env.MEDIA_BUCKET.list({ prefix: MUX_UPLOAD_PREFIX, limit: 1000 });
-    let record = null;
-    for (const object of recordList.objects || []) {
-      const item = await env.MEDIA_BUCKET.get(object.key);
-      if (!item) continue;
-      const candidate = await item.json().catch(() => null);
-      if (candidate?.assetId === assetId) { record = candidate; break; }
-    }
-    if (record && record.ownerId !== auth.sub) return json({ error: "Asset belongs to another user" }, 403, env);
-    const playback = Array.isArray(asset?.playback_ids) ? asset.playback_ids.find(item => item?.policy === "public") || asset.playback_ids[0] : null;
-    const playbackId = playback?.id || record?.playbackId || "";
-    return json({
-      provider: "mux",
-      assetId: asset?.id || assetId,
-      status: asset?.status || record?.status || "preparing",
-      playbackId,
-      hlsUrl: muxPlaybackUrl(playbackId),
-      duration: Number(asset?.duration || record?.duration || 0),
-      aspectRatio: asset?.aspect_ratio || record?.aspectRatio || ""
-    }, 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not read Mux asset status" }, e.status === 404 ? 404 : 503, env);
-  }
-}
+function hlsUrl(env, jobId) { return `${(env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in/media").replace(/\/$/, "")}/${HLS_PREFIX}${jobId}/master.m3u8`; }
+const pendingPrefix = "internal/pending/";
 let firebaseAccess = { account: "", token: "", expiresAt: 0 };
 function base64url(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_"); }
 function encodeJson(value) { return base64url(new TextEncoder().encode(JSON.stringify(value))); }
+function requirePipelineConfig(env) {
+  if (!(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL) || !env.FFMPEG_PROCESSOR_TOKEN || !env.FIREBASE_DATABASE_URL || !env.FIREBASE_SERVICE_ACCOUNT) throw new Error("Configure FFMPEG_PROCESSOR_TOKEN, FIREBASE_DATABASE_URL and FIREBASE_SERVICE_ACCOUNT before uploading");
+  if (!/^https:\/\/[^/]+\.(firebaseio\.com|firebasedatabase\.app)\/?$/.test(env.FIREBASE_DATABASE_URL)) throw new Error("FIREBASE_DATABASE_URL must be the HTTPS Realtime Database root URL");
+}
 async function firebaseToken(env) {
   const account = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
   if (account.project_id !== env.FIREBASE_PROJECT_ID) throw new Error("Firebase service account project mismatch");
@@ -396,6 +125,135 @@ async function firebaseRequest(env, dbPath, options = {}) {
   if (!response.ok) { const error = new Error(`Firebase request failed (${response.status})`); error.status = response.status; throw error; }
   return response;
 }
+async function processorRequest(env, route, body) {
+  const base = String(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL).replace(/\/$/, "");
+  let lastError;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const response = await fetch(`${base}${route}`, {
+        method: body ? "POST" : "GET",
+        headers: { "content-type": "application/json", "x-flaynity-job-token": env.FFMPEG_PROCESSOR_TOKEN },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(30000)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok) return data;
+      const error = new Error(data.error || `Processor request failed (${response.status})`);
+      error.status = response.status;
+      lastError = error;
+      if (![408, 425, 429, 500, 502, 503, 504].includes(response.status)) throw error;
+    } catch (error) {
+      lastError = error;
+      if (error.status && ![408, 425, 429, 500, 502, 503, 504].includes(error.status)) throw error;
+    }
+    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+  }
+  throw lastError || new Error("Processor request failed");
+}
+export function playbackMetadata(env, job) {
+  const master = hlsUrl(env, job.jobId);
+  const available = Array.isArray(job.available) ? job.available : [];
+  const manifest = job.manifestVersion ? master.replace("master.m3u8", `master-v${job.manifestVersion}.m3u8`) : master;
+  const videoQualities = { auto: master, hls: master, preferred: available.map(q => parseInt(q, 10)) };
+  available.forEach(q => { videoQualities[q] = master.replace("master.m3u8", `${q}/index.m3u8`); });
+  return { videoProvider: "r2-hls", videoLink: master, videoUrl: master, hlsUrl: master, hlsManifestUrl: manifest, hlsManifestVersion: job.manifestVersion || 0, hlsJobId: job.jobId, sourceKey: job.sourceKey, hlsStatus: job.status, hlsError: job.error || "", availableQualities: available, videoQualities, streamQualityLadder: available.map(q => parseInt(q, 10)), sourceWidth: job.source?.width || 0, sourceHeight: job.source?.height || 0, aspectRatio: job.source?.aspectRatio || 0, resolution: job.source ? `${job.source.width}x${job.source.height}` : "" };
+}
+function jobResponse(env, job) {
+  return { ...playbackMetadata(env, job), jobId: job.jobId, status: job.status, available: job.available || [], progress: job.progress || 0, currentQuality: job.currentQuality || null, error: job.error || "", publishedAt: job.publishedAt || 0 };
+}
+export function matchesPublication(record, job, env) {
+  return !!record && record.userId === job.ownerId && record.hlsJobId === job.jobId && record.hlsUrl === hlsUrl(env, job.jobId) && ["published", "scheduled"].includes(record.status);
+}
+async function syncPublication(env, job) {
+  if (!job.available?.includes("360p")) return false;
+  // Conditional PUT prevents stale callbacks from rolling back newer variants,
+  // deleting edits, or resurrecting a post removed during synchronization.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await firebaseRequest(env, job.publicationPath, { headers: { "X-Firebase-ETag": "true" } });
+    const record = await response.json();
+    if (!matchesPublication(record, job, env)) return false;
+    if (Number(record.hlsManifestVersion || 0) > job.manifestVersion) return true;
+    if (record.hlsManifestVersion === job.manifestVersion && record.hlsStatus === job.status && (record.hlsError || "") === (job.error || "")) return true;
+    try {
+      await firebaseRequest(env, job.publicationPath, { method: "PUT", headers: { "if-match": response.headers.get("etag") }, body: JSON.stringify({ ...record, ...playbackMetadata(env, job), updateTime: Date.now() }) });
+      return true;
+    } catch (e) { if (e.status !== 412 || attempt === 2) throw e; }
+  }
+  return false;
+}
+async function reconcileJob(env, job) {
+  const published = await syncPublication(env, job);
+  if (published && !job.publishedAt) {
+    job = await processorRequest(env, `/jobs/${job.jobId}/published`, {});
+  }
+  if (job.status === "failed" || (published && job.status === "ready")) await env.MEDIA_BUCKET.delete(`${pendingPrefix}${job.jobId}.json`);
+  return { job, published };
+}
+async function handleTranscode(request, env) {
+  let auth; try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
+  let body; try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400, env); }
+  const sourceKey = sanitizeSourceKey(body.sourceKey);
+  const contentType = String(body.contentType || "video/mp4").split(";")[0].toLowerCase();
+  if (!sourceKey || !ALLOWED_HLS_TYPES.has(contentType) || !/^[a-zA-Z0-9_-]{1,120}$/.test(body.contentId || "") || !["video-short", "video-long"].includes(body.type)) return json({ error: "Invalid video source, content ID or type" }, 400, env);
+  try {
+    requirePipelineConfig(env);
+    // Validate Firebase access BEFORE spending time encoding a non-publishable job.
+    await firebaseToken(env);
+    if (!await env.MEDIA_BUCKET.head(sourceKey)) return json({ error: "Source upload is not complete" }, 409, env);
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([auth.sub, sourceKey, body.contentId, body.type])));
+    const jobId = Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2, "0")).join("");
+    const sourceUrl = `${(env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in/media").replace(/\/$/, "")}/${sourceKey.split("/").map(encodeURIComponent).join("/")}`;
+    const registration = { jobId, sourceKey, sourceUrl, ownerId: auth.sub, publicationPath: `admin_panel/movies/${body.type === "video-short" ? "feels" : "user_uploads"}/${body.contentId}`, callbackUrl: `${new URL(request.url).origin}/api/internal/transcode-update` };
+    await env.MEDIA_BUCKET.put(`${pendingPrefix}${jobId}.json`, JSON.stringify(registration));
+    const job = await processorRequest(env, "/process", registration);
+    return json(jobResponse(env, job), 202, env);
+  } catch (e) { return json({ error: e.message || "Could not queue job" }, 503, env); }
+}
+async function handleTranscodeStatus(request, env, jobId, confirm = false) {
+  let auth; try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
+  if (!/^[a-f0-9-]{20,80}$/i.test(jobId)) return json({ error: "Invalid job ID" }, 400, env);
+  try {
+    const job = await processorRequest(env, `/jobs/${jobId}`);
+    if (job.ownerId !== auth.sub) return json({ error: "Job belongs to another user" }, 403, env);
+    if (confirm) {
+      if (!job.available?.includes("360p")) return json({ error: "360p is not ready" }, 409, env);
+      const result = await reconcileJob(env, job);
+      if (!result.published) return json({ error: "Firebase publication is not confirmed" }, 409, env);
+      return json(jobResponse(env, result.job), 200, env);
+    }
+    return json(jobResponse(env, job), 200, env);
+  } catch (e) { return json({ error: e.message }, e.status === 404 ? 404 : 503, env); }
+}
+async function handleTranscodeUpdate(request, env) {
+  if (!env.FFMPEG_PROCESSOR_TOKEN || request.headers.get("x-flaynity-job-token") !== env.FFMPEG_PROCESSOR_TOKEN) return unauthorized(env);
+  try {
+    const { jobId } = await request.json();
+    if (!/^[a-f0-9-]{20,80}$/i.test(jobId || "")) return json({ error: "Invalid job ID" }, 400, env);
+    const job = await processorRequest(env, `/jobs/${jobId}`);
+    await reconcileJob(env, job);
+    return json({ ok: true }, 200, env);
+  } catch (e) { return json({ error: e.message }, 503, env); }
+}
+async function reconcilePending(env) {
+  requirePipelineConfig(env);
+  const cursorKey = "internal/reconcile-cursor.json";
+  const saved = await env.MEDIA_BUCKET.get(cursorKey);
+  const cursor = saved ? (await saved.json()).cursor : undefined;
+  const page = await env.MEDIA_BUCKET.list({ prefix: pendingPrefix, limit: 20, ...(cursor ? { cursor } : {}) });
+  // Limit concurrency so a cold Render instance is not flooded by status checks.
+  for (const object of page.objects) {
+    try {
+      const stored = await env.MEDIA_BUCKET.get(object.key);
+      if (!stored) continue;
+      const registration = await stored.json();
+      let job;
+      try { job = await processorRequest(env, `/jobs/${registration.jobId}`); }
+      catch (e) { if (e.status !== 404) throw e; job = await processorRequest(env, "/process", registration); }
+      await reconcileJob(env, job);
+    } catch (e) { console.error("HLS reconciliation failed", object.key, e.message); }
+  }
+  await env.MEDIA_BUCKET.put(cursorKey, JSON.stringify({ cursor: page.truncated ? page.cursor : null }));
+}
 async function handleMedia(request, env, key) {
   const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers }); if (!obj) return new Response("Not found", { status: 404, headers: { ...corsHeaders(env), "Cache-Control": "no-store" } });
   const headers = new Headers(); obj.writeHttpMetadata(headers); headers.set("etag", obj.httpEtag); headers.set("Accept-Ranges", "bytes");
@@ -405,19 +263,15 @@ async function handleMedia(request, env, key) {
   if (obj.range?.offset != null && obj.range?.length != null) { headers.set("Content-Range", `bytes ${obj.range.offset}-${obj.range.offset + obj.range.length - 1}/${obj.size}`); headers.set("Content-Length", String(obj.range.length)); } else headers.set("Content-Length", String(obj.size));
   return new Response(request.method === "HEAD" ? null : obj.body, { status, headers });
 }
-export default { async fetch(request, env) {
-  const url = new URL(request.url);
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
-  if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "mux", mux: !!(env.MUX_TOKEN_ID && env.MUX_TOKEN_SECRET), time: Date.now() }, 200, env);
+export default { async scheduled(_event, env, ctx) { ctx.waitUntil(reconcilePending(env)); }, async fetch(request, env) {
+  const url = new URL(request.url); if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
+  if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-hls", ffmpeg: !!(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL), processorUrl: String(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL), time: Date.now() }, 200, env);
   if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
-  if (url.pathname === "/api/v1/mux/upload-url" && request.method === "POST") return handleMuxCreateUpload(request, env);
-  if (url.pathname === "/api/v1/mux/webhook" && request.method === "POST") return handleMuxWebhook(request, env);
-  const muxUploadStatus = url.pathname.match(/^\/api\/v1\/mux\/uploads\/([a-zA-Z0-9_-]{10,200})$/);
-  if (muxUploadStatus && request.method === "GET") return handleMuxUploadStatus(request, env, muxUploadStatus[1]);
-  const muxUploadCancel = url.pathname.match(/^\/api\/v1\/mux\/uploads\/([a-zA-Z0-9_-]{10,200})\/cancel$/);
-  if (muxUploadCancel && request.method === "POST") return handleMuxCancelUpload(request, env, muxUploadCancel[1]);
-  const muxAssetStatus = url.pathname.match(/^\/api\/v1\/mux\/assets\/([a-zA-Z0-9_-]{10,200})$/);
-  if (muxAssetStatus && request.method === "GET") return handleMuxAssetStatus(request, env, muxAssetStatus[1]);
+  if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") return handleTranscode(request, env);
+  if (url.pathname === "/api/internal/transcode-update" && request.method === "POST") return handleTranscodeUpdate(request, env);
+  const publication = url.pathname.match(/^\/api\/v1\/media\/transcode\/([a-f0-9-]{20,80})\/published$/i);
+  if (publication && request.method === "POST") return handleTranscodeStatus(request, env, publication[1], true);
+  if (url.pathname.startsWith("/api/v1/media/transcode/") && request.method === "GET") return handleTranscodeStatus(request, env, url.pathname.slice("/api/v1/media/transcode/".length));
   if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) { const key = decodeURIComponent(url.pathname.slice("/media/".length)); if ((!/^uploads\//.test(key)) || key.includes("..")) return new Response("Bad key", { status: 400 }); return handleMedia(request, env, key); }
   return json({ error: "Not found" }, 404, env);
 } };

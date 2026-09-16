@@ -3,7 +3,6 @@ import { AwsClient } from "aws4fetch";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const MAX_UPLOAD_EXPIRY = 900;
 const HLS_PREFIX = "uploads/hls/";
-const DEFAULT_FFMPEG_PROCESSOR_URL = "https://flaynity-video-processor.onrender.com";
 const ALLOWED_HLS_TYPES = new Set(["video/mp4", "video/webm", "video/quicktime", "video/x-matroska"]);
 
 function corsHeaders(env) {
@@ -99,8 +98,12 @@ const pendingPrefix = "internal/pending/";
 let firebaseAccess = { account: "", token: "", expiresAt: 0 };
 function base64url(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_"); }
 function encodeJson(value) { return base64url(new TextEncoder().encode(JSON.stringify(value))); }
+const DEFAULT_FFMPEG_PROCESSOR_URL = "https://flaynity-video-processor.onrender.com";
+function processorBaseUrl(env) {
+  return String(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL).replace(/\/$/, "");
+}
 function requirePipelineConfig(env) {
-  if (!(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL) || !env.FFMPEG_PROCESSOR_TOKEN || !env.FIREBASE_DATABASE_URL || !env.FIREBASE_SERVICE_ACCOUNT) throw new Error("Configure FFMPEG_PROCESSOR_TOKEN, FIREBASE_DATABASE_URL and FIREBASE_SERVICE_ACCOUNT before uploading");
+  if (!env.FFMPEG_PROCESSOR_TOKEN || !env.FIREBASE_DATABASE_URL || !env.FIREBASE_SERVICE_ACCOUNT) throw new Error("Configure FFMPEG_PROCESSOR_TOKEN, FIREBASE_DATABASE_URL and FIREBASE_SERVICE_ACCOUNT before uploading");
   if (!/^https:\/\/[^/]+\.(firebaseio\.com|firebasedatabase\.app)\/?$/.test(env.FIREBASE_DATABASE_URL)) throw new Error("FIREBASE_DATABASE_URL must be the HTTPS Realtime Database root URL");
 }
 async function firebaseToken(env) {
@@ -126,7 +129,7 @@ async function firebaseRequest(env, dbPath, options = {}) {
   return response;
 }
 async function processorRequest(env, route, body) {
-  const base = String(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL).replace(/\/$/, "");
+  const base = processorBaseUrl(env);
   let lastError;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
@@ -265,7 +268,7 @@ async function handleMedia(request, env, key) {
 }
 export default { async scheduled(_event, env, ctx) { ctx.waitUntil(reconcilePending(env)); }, async fetch(request, env) {
   const url = new URL(request.url); if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
-  if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-hls", ffmpeg: !!(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL), processorUrl: String(env.FFMPEG_PROCESSOR_URL || DEFAULT_FFMPEG_PROCESSOR_URL), time: Date.now() }, 200, env);
+  if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-hls", ffmpeg: true, processorUrl: processorBaseUrl(env), time: Date.now() }, 200, env);
   if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
   if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") return handleTranscode(request, env);
   if (url.pathname === "/api/internal/transcode-update" && request.method === "POST") return handleTranscodeUpdate(request, env);

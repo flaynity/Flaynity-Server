@@ -275,6 +275,14 @@ async function handleMuxWebhook(request, env) {
     if (type === "video.upload.asset_created") {
       record.status = "asset_created";
       record.assetId = data?.asset_id || record.assetId || "";
+      // Mux may expose playback_ids as soon as the asset is created. Keep the
+      // ID in the server record, but do not mark the asset playable until the
+      // video.asset.ready webhook arrives.
+      const playback = Array.isArray(data?.playback_ids) ? data.playback_ids.find(item => item?.policy === "public") || data.playback_ids[0] : null;
+      if (playback?.id) {
+        record.playbackId = playback.id;
+        record.hlsUrl = muxPlaybackUrl(playback.id);
+      }
     } else if (type === "video.asset.ready") {
       record.status = "ready";
       record.assetId = data?.id || record.assetId || "";

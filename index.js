@@ -92,17 +92,18 @@ async function handleUploadUrl(request, env) {
   catch (e) { return json({ error: e?.message || "Could not create upload URL" }, 500, env); }
 }
 async function handleMedia(request, env, key) {
-  const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers }); if (!obj) return new Response("Not found", { status: 404, headers: { ...corsHeaders(env), "Cache-Control": "no-store" } });
-  const headers = new Headers(); obj.writeHttpMetadata(headers); headers.set("etag", obj.httpEtag); headers.set("Accept-Ranges", "bytes");
-  headers.set("Cache-Control", "public, max-age=31536000, immutable");
-  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v)); const status = obj.range ? 206 : 200;
-  if (obj.range?.offset != null && obj.range?.length != null) { headers.set("Content-Range", `bytes ${obj.range.offset}-${obj.range.offset + obj.range.length - 1}/${obj.size}`); headers.set("Content-Length", String(obj.range.length)); } else headers.set("Content-Length", String(obj.size));
-  return new Response(request.method === "HEAD" ? null : obj.body, { status, headers });
+  const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers });
+  if (!obj) return new Response("Not found", { status: 404, headers: { ...corsHeaders(env), "Cache-Control": "no-store" } });
+  const headers = new Headers(); obj.writeHttpMetadata(headers); headers.set("etag", obj.httpEtag); headers.set("Accept-Ranges", "bytes"); headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  if (/\.mp4$/i.test(key)) headers.set("Content-Type", "video/mp4"); else if (/\.webm$/i.test(key)) headers.set("Content-Type", "video/webm"); else if (/\.(jpg|jpeg)$/i.test(key)) headers.set("Content-Type", "image/jpeg"); else if (/\.png$/i.test(key)) headers.set("Content-Type", "image/png");
+  Object.entries(corsHeaders(env)).forEach(([k,v])=>headers.set(k,v)); const status=obj.range?206:200;
+  if (obj.range?.offset!=null && obj.range?.length!=null) { headers.set("Content-Range",`bytes ${obj.range.offset}-${obj.range.offset+obj.range.length-1}/${obj.size}`); headers.set("Content-Length",String(obj.range.length)); } else headers.set("Content-Length",String(obj.size));
+  return new Response(request.method === "HEAD" ? null : obj.body,{status,headers});
 }
-export default { async scheduled(_event, env, ctx) { ctx.waitUntil(reconcilePending(env)); }, async fetch(request, env) {
-  const url = new URL(request.url); if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
-  if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-mp4", time: Date.now() }, 200, env);
-  if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
-  if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) { const key = decodeURIComponent(url.pathname.slice("/media/".length)); if ((!/^uploads\//.test(key)) || key.includes("..")) return new Response("Bad key", { status: 400 }); return handleMedia(request, env, key); }
-  return json({ error: "Not found" }, 404, env);
+export default { async fetch(request, env) {
+  const url=new URL(request.url); if(request.method==="OPTIONS") return new Response(null,{status:204,headers:corsHeaders(env)});
+  if(url.pathname==="/api/health") return json({ok:true,service:"flaynity-server",videoPipeline:"r2-mp4",time:Date.now()},200,env);
+  if(url.pathname==="/api/v1/media/upload-url" && request.method==="POST") return handleUploadUrl(request,env);
+  if(url.pathname.startsWith("/media/") && (request.method==="GET"||request.method==="HEAD")){ const key=decodeURIComponent(url.pathname.slice("/media/".length)); if(!/^uploads\//.test(key)||key.includes("..")) return new Response("Bad key",{status:400,headers:corsHeaders(env)}); return handleMedia(request,env,key); }
+  return json({error:"Not found"},404,env);
 } };

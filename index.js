@@ -2,7 +2,8 @@ import { AwsClient } from "aws4fetch";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const MAX_UPLOAD_EXPIRY = 900;
-const ALLOWED_VIDEO_TYPES = new Set(["video/mp4"]);
+const HLS_PREFIX = "uploads/hls/";
+const ALLOWED_HLS_TYPES = new Set(["video/mp4", "video/webm", "video/quicktime", "video/x-matroska"]);
 
 function corsHeaders(env) {
   return {
@@ -92,122 +93,33 @@ async function handleUploadUrl(request, env) {
   try { const uploadUrl = await createPresignedPut(env, key, contentType); const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`; return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env); }
   catch (e) { return json({ error: e?.message || "Could not create upload URL" }, 500, env); }
 }
-const pendingPrefix = "internal/pending/";
-let firebaseAccess = { account: "", token: "", expiresAt: 0 };
-function base64url(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_"); }
-function encodeJson(value) { return base64url(new TextEncoder().encode(JSON.stringify(value))); }
-async function firebaseToken(env) {
-  const account = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
-  if (account.project_id !== env.FIREBASE_PROJECT_ID) throw new Error("Firebase service account project mismatch");
-  if (firebaseAccess.account === account.client_email && Date.now() < firebaseAccess.expiresAt) return firebaseAccess.token;
-  const now = Math.floor(Date.now() / 1000);
-  const input = `${encodeJson({ alg: "RS256", typ: "JWT" })}.${encodeJson({ iss: account.client_email, scope: "https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 })}`;
-  const keyBytes = Uint8Array.from(atob(account.private_key.replace(/-----[^-]+-----/g, "").replace(/\s/g, "")), c => c.charCodeAt(0));
-  const key = await crypto.subtle.importKey("pkcs8", keyBytes, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
-  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(input));
-  const response = await fetch("https://oauth2.googleapis.com/token", { method: "POST", body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: `${input}.${base64url(new Uint8Array(signature))}` }) });
-  const data = await response.json();
-  if (!response.ok || !data.access_token) throw new Error("Firebase service-account authorization failed");
-  firebaseAccess = { account: account.client_email, token: data.access_token, expiresAt: Date.now() + (Number(data.expires_in) - 120) * 1000 };
-  return data.access_token;
-}
-async function firebaseRequest(env, dbPath, options = {}) {
-  const base = String(env.FIREBASE_DATABASE_URL || "").replace(/\/$/, "");
-  if (!/^https:\/\/[^/]+\.(firebaseio\.com|firebasedatabase\.app)$/.test(base)) throw new Error("Set FIREBASE_DATABASE_URL to the HTTPS Realtime Database root URL");
-  const response = await fetch(`${base}/${dbPath}.json`, { ...options, headers: { "Authorization": `Bearer ${await firebaseToken(env)}`, "Content-Type": "application/json", ...options.headers } });
-  if (!response.ok) { const error = new Error(`Firebase request failed (${response.status})`); error.status = response.status; throw error; }
-  return response;
-}
-
-function directVideoUrl(env, sourceKey) {
-  return `${(env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in/media").replace(/\/$/, "")}/${sourceKey.split("/").map(encodeURIComponent).join("/")}`;
-}
-function directPlaybackMetadata(sourceKey, videoUrl) {
-  return {
-    videoProvider: "r2",
-    videoUrl,
-    videoLink: videoUrl,
-    sourceKey,
-    videoStatus: "ready",
-    hlsStatus: "disabled",
-    hlsError: "",
-    hlsJobId: null,
-    hlsUrl: null,
-    hlsManifestUrl: null,
-    hlsManifestVersion: 0,
-    availableQualities: [],
-    videoQualities: { auto: videoUrl, preferred: [] },
-    streamQualityLadder: []
-  };
-}
-async function publishDirectVideo(env, publicationPath, authUserId, sourceKey, videoUrl) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const response = await firebaseRequest(env, publicationPath, { headers: { "X-Firebase-ETag": "true" } });
-    const record = await response.json();
-    if (!record || record.userId !== authUserId || !["published", "scheduled"].includes(record.status)) return false;
-    const updated = { ...record, ...directPlaybackMetadata(sourceKey, videoUrl), updateTime: Date.now() };
-    try {
-      await firebaseRequest(env, publicationPath, {
-        method: "PUT",
-        headers: { "if-match": response.headers.get("etag") || "*" },
-        body: JSON.stringify(updated)
-      });
-      return true;
-    } catch (e) {
-      if (e.status !== 412 || attempt === 2) throw e;
-    }
-  }
-  return false;
-}
-async function handleTranscode(request, env) {
-  let auth; try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
-  let body; try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400, env); }
-  const sourceKey = sanitizeSourceKey(body.sourceKey);
-  const contentType = String(body.contentType || "video/mp4").split(";")[0].toLowerCase();
-  if (!sourceKey || !/\.mp4$/i.test(sourceKey) || contentType !== "video/mp4" || !/^[a-zA-Z0-9_-]{1,120}$/.test(body.contentId || "") || !["video-short", "video-long"].includes(body.type)) {
-    return json({ error: "Invalid MP4 video source, content ID or type" }, 400, env);
-  }
-  try {
-    await firebaseToken(env);
-    if (!await env.MEDIA_BUCKET.head(sourceKey)) return json({ error: "Source upload is not complete" }, 409, env);
-    const videoUrl = directVideoUrl(env, sourceKey);
-    const publicationPath = `admin_panel/movies/${body.type === "video-short" ? "feels" : "user_uploads"}/${body.contentId}`;
-    const published = await publishDirectVideo(env, publicationPath, auth.sub, sourceKey, videoUrl);
-    if (!published) return json({ error: "Firebase publication record is missing or cannot be updated" }, 409, env);
-    return json({
-      videoProvider: "r2",
-      videoUrl,
-      videoLink: videoUrl,
-      sourceKey,
-      status: "ready",
-      progress: 100,
-      available: [],
-      currentQuality: null,
-      error: "",
-      publishedAt: Date.now()
-    }, 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not publish MP4 video" }, 503, env);
-  }
-}
 async function handleMedia(request, env, key) {
-  const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers }); if (!obj) return new Response("Not found", { status: 404, headers: { ...corsHeaders(env), "Cache-Control": "no-store" } });
-  const headers = new Headers(); obj.writeHttpMetadata(headers); headers.set("etag", obj.httpEtag); headers.set("Accept-Ranges", "bytes");
-  headers.set("Cache-Control", key.endsWith("/master.m3u8") ? "no-store" : "public, max-age=31536000, immutable");
-  if (/\.mp4$/i.test(key)) headers.set("Content-Type", "video/mp4"); else if (/\.webm$/i.test(key)) headers.set("Content-Type", "video/webm"); else if (/\.mov$/i.test(key)) headers.set("Content-Type", "video/quicktime");
-  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v)); const status = obj.range ? 206 : 200;
-  if (obj.range?.offset != null && obj.range?.length != null) { headers.set("Content-Range", `bytes ${obj.range.offset}-${obj.range.offset + obj.range.length - 1}/${obj.size}`); headers.set("Content-Length", String(obj.range.length)); } else headers.set("Content-Length", String(obj.size));
+  const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers });
+  if (!obj) return new Response("Not found", { status: 404, headers: { ...corsHeaders(env), "Cache-Control": "no-store" } });
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set("etag", obj.httpEtag);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  const contentType = obj.httpMetadata?.contentType || "application/octet-stream";
+  headers.set("Content-Type", contentType);
+  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
+  const status = obj.range ? 206 : 200;
+  if (obj.range?.offset != null && obj.range?.length != null) {
+    headers.set("Content-Range", `bytes ${obj.range.offset}-${obj.range.offset + obj.range.length - 1}/${obj.size}`);
+    headers.set("Content-Length", String(obj.range.length));
+  } else headers.set("Content-Length", String(obj.size));
   return new Response(request.method === "HEAD" ? null : obj.body, { status, headers });
 }
+
 export default { async fetch(request, env) {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
   if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-mp4", ffmpeg: false, time: Date.now() }, 200, env);
   if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
-  if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") return handleTranscode(request, env);
   if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {
     const key = decodeURIComponent(url.pathname.slice("/media/".length));
-    if ((!/^uploads\//.test(key)) || key.includes("..")) return new Response("Bad key", { status: 400 });
+    if ((!/^uploads\//.test(key)) || key.includes("..")) return new Response("Bad key", { status: 400, headers: corsHeaders(env) });
     return handleMedia(request, env, key);
   }
   return json({ error: "Not found" }, 404, env);

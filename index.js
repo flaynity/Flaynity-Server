@@ -93,34 +93,77 @@ async function handleUploadUrl(request, env) {
   try { const uploadUrl = await createPresignedPut(env, key, contentType); const mediaBase = env.MEDIA_BASE_URL || `${new URL(request.url).origin}/media`; return json({ key, uploadUrl, publicUrl: `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`, expiresIn: MAX_UPLOAD_EXPIRY }, 200, env); }
   catch (e) { return json({ error: e?.message || "Could not create upload URL" }, 500, env); }
 }
-async function handleMedia(request, env, key) {
-  const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers });
-  if (!obj) return new Response("Not found", { status: 404, headers: { ...corsHeaders(env), "Cache-Control": "no-store" } });
-  const headers = new Headers();
-  obj.writeHttpMetadata(headers);
-  headers.set("etag", obj.httpEtag);
-  headers.set("Accept-Ranges", "bytes");
-  headers.set("Cache-Control", "public, max-age=31536000, immutable");
-  const contentType = obj.httpMetadata?.contentType || "application/octet-stream";
-  headers.set("Content-Type", contentType);
-  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
-  const status = obj.range ? 206 : 200;
-  if (obj.range?.offset != null && obj.range?.length != null) {
-    headers.set("Content-Range", `bytes ${obj.range.offset}-${obj.range.offset + obj.range.length - 1}/${obj.size}`);
-    headers.set("Content-Length", String(obj.range.length));
-  } else headers.set("Content-Length", String(obj.size));
-  return new Response(request.method === "HEAD" ? null : obj.body, { status, headers });
+function directVideoMetadata(env, sourceKey) {
+  const mediaBase = (env.MEDIA_BASE_URL || "https://cdn.flaynity.indevs.in/media").replace(/\/$/, "");
+  const videoUrl = `${mediaBase}/${sourceKey.split("/").map(encodeURIComponent).join("/")}`;
+  return {
+    videoProvider: "r2",
+    videoLink: videoUrl,
+    videoUrl,
+    hlsUrl: "",
+    hlsManifestUrl: "",
+    hlsManifestVersion: 0,
+    hlsJobId: "",
+    hlsStatus: "ready",
+    hlsError: "",
+    availableQualities: [],
+    videoQualities: { auto: videoUrl, preferred: [] },
+    streamQualityLadder: [],
+    sourceKey
+  };
 }
 
-export default { async fetch(request, env) {
-  const url = new URL(request.url);
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
-  if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-mp4", ffmpeg: false, time: Date.now() }, 200, env);
+// Compatibility endpoint: old clients may still call /transcode. It no longer
+// starts FFmpeg; it simply returns the uploaded R2 MP4 as the playable source.
+async function handleTranscode(request, env) {
+  let auth;
+  try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400, env); }
+  const sourceKey = sanitizeSourceKey(body.sourceKey);
+  if (!sourceKey) return json({ error: "Invalid video source" }, 400, env);
+  try {
+    const source = await env.MEDIA_BUCKET.head(sourceKey);
+    if (!source) return json({ error: "Source upload is not complete" }, 409, env);
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([auth.sub, sourceKey, body.contentId || "", body.type || ""])));
+    const jobId = Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2, "0")).join("");
+    return json({ ...directVideoMetadata(env, sourceKey), jobId, status: "ready", available: [], progress: 100, ownerId: auth.sub, publishedAt: Date.now() }, 200, env);
+  } catch (e) { return json({ error: e?.message || "Could not prepare video" }, 503, env); }
+}
+
+async function handleTranscodeStatus(request, env, jobId, confirm = false) {
+  let auth;
+  try { auth = await verifyFirebaseToken(request, env); } catch (e) { return unauthorized(env, e.message); }
+  if (!/^[a-f0-9-]{20,80}$/i.test(jobId)) return json({ error: "Invalid job ID" }, 400, env);
+  return json({ error: "Video processing is disabled; use the uploaded R2 MP4 directly." }, 410, env);
+}
+
+async function handleTranscodeUpdate(request, env) {
+  return json({ ok: true, processing: false }, 200, env);
+}
+
+async function reconcilePending(_env) {
+  // FFmpeg/HLS reconciliation is intentionally disabled. Videos are published
+  // directly from their uploaded R2 MP4 objects.
+}
+async function handleMedia(request, env, key) {
+  const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers }); if (!obj) return new Response("Not found", { status: 404, headers: { ...corsHeaders(env), "Cache-Control": "no-store" } });
+  const headers = new Headers(); obj.writeHttpMetadata(headers); headers.set("etag", obj.httpEtag); headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", key.endsWith("/master.m3u8") ? "no-store" : "public, max-age=31536000, immutable");
+  if (key.endsWith(".m3u8")) headers.set("Content-Type", "application/vnd.apple.mpegurl"); else if (key.endsWith(".ts")) headers.set("Content-Type", "video/mp2t");
+  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v)); const status = obj.range ? 206 : 200;
+  if (obj.range?.offset != null && obj.range?.length != null) { headers.set("Content-Range", `bytes ${obj.range.offset}-${obj.range.offset + obj.range.length - 1}/${obj.size}`); headers.set("Content-Length", String(obj.range.length)); } else headers.set("Content-Length", String(obj.size));
+  return new Response(request.method === "HEAD" ? null : obj.body, { status, headers });
+}
+export default { async scheduled(_event, env, ctx) { ctx.waitUntil(reconcilePending(env)); }, async fetch(request, env) {
+  const url = new URL(request.url); if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
+  if (url.pathname === "/api/health") return json({ ok: true, service: "flaynity-server", videoPipeline: "r2", ffmpeg: false, time: Date.now() }, 200, env);
   if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") return handleUploadUrl(request, env);
-  if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {
-    const key = decodeURIComponent(url.pathname.slice("/media/".length));
-    if ((!/^uploads\//.test(key)) || key.includes("..")) return new Response("Bad key", { status: 400, headers: corsHeaders(env) });
-    return handleMedia(request, env, key);
-  }
+  if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") return handleTranscode(request, env);
+  if (url.pathname === "/api/internal/transcode-update" && request.method === "POST") return handleTranscodeUpdate(request, env);
+  const publication = url.pathname.match(/^\/api\/v1\/media\/transcode\/([a-f0-9-]{20,80})\/published$/i);
+  if (publication && request.method === "POST") return handleTranscodeStatus(request, env, publication[1], true);
+  if (url.pathname.startsWith("/api/v1/media/transcode/") && request.method === "GET") return handleTranscodeStatus(request, env, url.pathname.slice("/api/v1/media/transcode/".length));
+  if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) { const key = decodeURIComponent(url.pathname.slice("/media/".length)); if ((!/^uploads\//.test(key)) || key.includes("..")) return new Response("Bad key", { status: 400 }); return handleMedia(request, env, key); }
   return json({ error: "Not found" }, 404, env);
 } };

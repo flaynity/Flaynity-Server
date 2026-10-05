@@ -12,7 +12,7 @@ bucket_name = "flaynity-storage"
 [[d1_databases]]
 binding = "JOB_DB"
 database_name = "flaynity-transcode-jobs"
-database_id = "0863e9e3-3e46-4001-83aa-7d7bad3e04f5"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 
 [vars]
 APP_ORIGIN = "https://flaynity.indevs.in"

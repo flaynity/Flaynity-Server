@@ -211,10 +211,10 @@ async function handleUploadUrl(request, env) {
   }
 }
 
-async function gpuRequest(env, path, options = {}) {
-  const base = String(env.GPU_SERVER_URL || "").trim().replace(/\/$/, "");
+async function gpuRequest(env, endpointEnv, options = {}) {
+  const endpoint = String(options.url || env[endpointEnv] || "").trim();
   const token = String(env.GPU_SERVER_TOKEN || "").trim();
-  if (!base) throw new Error("GPU_SERVER_URL is not configured");
+  if (!endpoint) throw new Error(`${endpointEnv} is not configured`);
   if (!token) throw new Error("GPU_SERVER_TOKEN is not configured");
 
   const headers = new Headers(options.headers || {});
@@ -223,7 +223,7 @@ async function gpuRequest(env, path, options = {}) {
     headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(`${base}${path}`, { ...options, headers });
+  const response = await fetch(endpoint, { ...options, headers });
   const text = await response.text();
   let data;
   try {
@@ -266,7 +266,7 @@ async function handleTranscodeJob(request, env) {
   }
 
   try {
-    const data = await gpuRequest(env, "/create-job", {
+    const data = await gpuRequest(env, "GPU_CREATE_JOB_URL", {
       method: "POST",
       body: JSON.stringify({ sourceKey, ...(jobId ? { jobId } : {}) })
     });
@@ -290,8 +290,13 @@ async function handleTranscodeStatus(request, env) {
   }
 
   try {
-    return json(await gpuRequest(env, `/job-status?callId=${encodeURIComponent(callId)}`, {
-      method: "GET"
+    const endpoint = String(env.GPU_JOB_STATUS_URL || "").trim();
+    if (!endpoint) throw new Error("GPU_JOB_STATUS_URL is not configured");
+    const statusUrl = new URL(endpoint);
+    statusUrl.searchParams.set("callId", callId);
+    return json(await gpuRequest(env, "GPU_JOB_STATUS_URL", {
+      method: "GET",
+      url: statusUrl.toString()
     }), 200, env);
   } catch (e) {
     return json({ error: e?.message || "Could not read video transcoding status" }, 502, env);
@@ -351,10 +356,10 @@ export default {
       return json({
         ok: true,
         service: "flaynity-server",
-        videoPipeline: env.GPU_SERVER_URL ? "gpu-r2-hls" : "r2-mp4",
-        gpuServer: !!env.GPU_SERVER_URL,
+        videoPipeline: env.GPU_CREATE_JOB_URL && env.GPU_JOB_STATUS_URL ? "gpu-r2-hls" : "r2-mp4",
+        gpuServer: !!(env.GPU_CREATE_JOB_URL && env.GPU_JOB_STATUS_URL),
         ffmpeg: false,
-        hls: !!env.GPU_SERVER_URL,
+        hls: !!(env.GPU_CREATE_JOB_URL && env.GPU_JOB_STATUS_URL),
         time: Date.now()
       }, 200, env);
     }

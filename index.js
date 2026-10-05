@@ -7,31 +7,280 @@ function corsHeaders(env) {
   return {
     "Access-Control-Allow-Origin": env.APP_ORIGIN || "https://flaynity.indevs.in",
     "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization,Content-Type,Range,X-Requested-With,X-Worker-Secret",
+    "Access-Control-Allow-Headers": "Authorization,Content-Type,Range,X-Requested-With",
     "Access-Control-Expose-Headers": "Accept-Ranges,Content-Length,Content-Range,ETag,Content-Type",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
   };
 }
-function json(data, status = 200, env) { const headers = new Headers(JSON_HEADERS); Object.entries(corsHeaders(env)).forEach(([k,v])=>headers.set(k,v)); return new Response(JSON.stringify(data),{status,headers}); }
-function unauthorized(env,message="Unauthorized"){return json({error:message},401,env);}
-function base64UrlDecode(value){const padded=value.replace(/-/g,"+").replace(/_/g,"/")+"===".slice((value.length+3)%4);const bin=atob(padded);const bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);return bytes;}
-function decodeJwt(token){const parts=token.split(".");if(parts.length!==3)throw new Error("Malformed token");const text=new TextDecoder();return{header:JSON.parse(text.decode(base64UrlDecode(parts[0]))),payload:JSON.parse(text.decode(base64UrlDecode(parts[1]))),signature:base64UrlDecode(parts[2]),signingInput:new TextEncoder().encode(`${parts[0]}.${parts[1]}`)};}
-let certCache={expiresAt:0,keys:new Map()};const JWKS_CACHE_SECONDS=300;
-async function fetchGoogleJwks(forceRefresh=false){const url=forceRefresh?`https://www.googleapis.com/oauth2/v3/certs?flaynity_refresh=${Date.now()}`:"https://www.googleapis.com/oauth2/v3/certs";const response=await fetch(url,{headers:{"Cache-Control":forceRefresh?"no-cache":"max-age=300"},...(forceRefresh?{cache:"no-store"}:{cf:{cacheTtl:JWKS_CACHE_SECONDS}})});if(!response.ok)throw new Error("Could not load Google signing keys");const body=await response.json();const keys=new Map();for(const jwk of body.keys||[])if(jwk.kty==="RSA"&&jwk.kid&&jwk.n&&jwk.e)keys.set(jwk.kid,await crypto.subtle.importKey("jwk",jwk,{name:"RSASSA-PKCS1-v1_5",hash:"SHA-256"},false,["verify"]));if(!keys.size)throw new Error("Google signing keys unavailable");const maxAge=Number((response.headers.get("cache-control")||"").match(/max-age=(\d+)/)?.[1]||JWKS_CACHE_SECONDS);certCache={expiresAt:Date.now()+Math.min(Math.max(maxAge,60),JWKS_CACHE_SECONDS)*1000,keys};return keys;}
-async function getGoogleJwks(forceRefresh=false){if(!forceRefresh&&Date.now()<certCache.expiresAt&&certCache.keys.size)return certCache.keys;return fetchGoogleJwks(forceRefresh);}
-async function verifyFirebaseToken(request,env){const authHeader=request.headers.get("Authorization")||"";if(!/^Bearer\s+/i.test(authHeader))throw new Error("Authentication token missing");const token=authHeader.replace(/^Bearer\s+/i,"").trim();if(!token)throw new Error("Authentication token missing");try{const{header,payload,signature,signingInput}=decodeJwt(token);if(header.alg!=="RS256"||!header.kid)throw new Error("Invalid authentication token header");let keys=await getGoogleJwks();let key=keys.get(header.kid);if(!key){keys=await getGoogleJwks(true);key=keys.get(header.kid);}if(!key)throw new Error("Unknown token key");if(!await crypto.subtle.verify({name:"RSASSA-PKCS1-v1_5"},key,signature,signingInput))throw new Error("Invalid token signature");const now=Math.floor(Date.now()/1000);if(!payload.exp||payload.exp<=now)throw new Error("Authentication token expired");if(payload.iat&&payload.iat>now+60)throw new Error("Authentication token issued in the future");if(payload.aud!==env.FIREBASE_PROJECT_ID)throw new Error("Authentication token has wrong audience");if(payload.iss!==`https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`)throw new Error("Authentication token has wrong issuer");if(!payload.sub)throw new Error("Authentication token has no user id");return payload;}catch(primaryError){try{const key=env.FIREBASE_WEB_API_KEY||"AIzaSyCiUTQp_QDSbBIOGJXKI7jJmzQHPu8L14I";const response=await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(key)}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({idToken:token}),cache:"no-store"});if(response.ok){const info=await response.json();const account=Array.isArray(info.users)?info.users[0]:null;if(account?.localId)return{sub:account.localId,user_id:account.localId,aud:env.FIREBASE_PROJECT_ID,iss:`https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`,email:account.email||undefined,email_verified:!!account.emailVerified};}}catch{}throw primaryError;}}
-function sanitizeKey(input){const key=String(input||"").replace(/^\/+/,"");if(!key||key.length>700||key.includes("..")||!/^uploads\/(?:[a-zA-Z0-9_-]+\/){1,2}[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(key))return null;return key;}
-async function createPresignedPut(env,key,contentType){const endpoint=`https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.MEDIA_BUCKET_NAME||"flaynity-storage"}/${key}`;const client=new AwsClient({accessKeyId:env.R2_ACCESS_KEY_ID,secretAccessKey:env.R2_SECRET_ACCESS_KEY,service:"s3",region:"auto"});const signed=await client.sign(new Request(`${endpoint}?X-Amz-Expires=${MAX_UPLOAD_EXPIRY}`,{method:"PUT"}),{aws:{signQuery:true}});return signed.url.toString();}
-async function handleUploadUrl(request,env){try{await verifyFirebaseToken(request,env);}catch(e){return unauthorized(env,e.message||"Unauthorized");}let body;try{body=await request.json();}catch{return json({error:"Invalid JSON"},400,env);}const key=sanitizeKey(body.key);const contentType=String(body.contentType||"application/octet-stream").slice(0,120);if(!key)return json({error:"Invalid media key"},400,env);if(!/^(image|video|audio)\//i.test(contentType))return json({error:"Unsupported content type"},400,env);try{const uploadUrl=await createPresignedPut(env,key,contentType);const configuredBase=(env.MEDIA_BASE_URL||"").replace(/\/$/,"");const requestOrigin=new URL(request.url).origin;const mediaBase=(configuredBase&&!/cdn\.flaynity\.indevs\.in/i.test(configuredBase)?configuredBase:`${requestOrigin}/media`);return json({ok:true,key,uploadUrl,publicUrl:`${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`,expiresIn:MAX_UPLOAD_EXPIRY,contentType,videoProvider:key.includes("/videos/")||key.includes("/feels/")?"r2":undefined},200,env);}catch(e){return json({error:e?.message||"Could not create upload URL"},500,env);}}
-function workerAuthorized(request,env){const secret=String(env.TRANSCODER_WORKER_SECRET||"");return !!secret&&(request.headers.get("X-Worker-Secret")||"")===secret;}
-async function ensureJobsTable(env){await env.JOB_DB.prepare(`CREATE TABLE IF NOT EXISTS transcode_jobs (job_id TEXT PRIMARY KEY,source_url TEXT NOT NULL,metadata TEXT NOT NULL DEFAULT '{}',status TEXT NOT NULL DEFAULT 'queued',progress INTEGER NOT NULL DEFAULT 0,worker_id TEXT,error TEXT,video_provider TEXT,video_url TEXT,video_link TEXT,hls_url TEXT,output_prefix TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT,user_id TEXT)`).run();}
-async function handleCreateTranscodeJob(request,env){let user;try{user=await verifyFirebaseToken(request,env);}catch(e){return unauthorized(env,e.message||"Unauthorized");}let body;try{body=await request.json();}catch{return json({error:"Invalid JSON"},400,env);}const sourceUrl=String(body.sourceUrl||"").trim();if(!/^https:\/\//i.test(sourceUrl))return json({error:"sourceUrl must be an https URL"},400,env);const jobId=String(body.jobId||crypto.randomUUID()).replace(/[^a-zA-Z0-9_-]/g,"").slice(0,80);if(!jobId)return json({error:"Invalid jobId"},400,env);const now=new Date().toISOString();await ensureJobsTable(env);await env.JOB_DB.prepare(`INSERT INTO transcode_jobs (job_id,source_url,metadata,status,progress,created_at,updated_at,user_id) VALUES (?,?,?,'queued',0,?,?,?)`).bind(jobId,sourceUrl,JSON.stringify(body.metadata||{}),now,now,user.sub).run();return json({ok:true,jobId,status:"queued",statusUrl:`/api/v1/transcode/jobs/${encodeURIComponent(jobId)}`},202,env);}
-async function handleWorkerClaim(request,env){if(!workerAuthorized(request,env))return unauthorized(env,"Invalid worker secret");await ensureJobsTable(env);const workerId=String(request.headers.get("X-Worker-Id")||"kaggle-worker").slice(0,120);const now=new Date().toISOString();const row=await env.JOB_DB.prepare(`UPDATE transcode_jobs SET status='processing',progress=1,worker_id=?,updated_at=? WHERE job_id=(SELECT job_id FROM transcode_jobs WHERE status='queued' ORDER BY created_at LIMIT 1) AND status='queued' RETURNING job_id,source_url,metadata,status,progress,worker_id,created_at,updated_at`).bind(workerId,now).first();return json({job:row?{jobId:row.job_id,sourceUrl:row.source_url,metadata:JSON.parse(row.metadata||"{}"),status:row.status,progress:row.progress,workerId:row.worker_id,createdAt:row.created_at,updatedAt:row.updated_at}:null},200,env);}
-async function handleWorkerUpdate(request,env,jobId){if(!workerAuthorized(request,env))return unauthorized(env,"Invalid worker secret");let body;try{body=await request.json();}catch{return json({error:"Invalid JSON"},400,env);}await ensureJobsTable(env);const map={status:"status",progress:"progress",error:"error",videoProvider:"video_provider",videoUrl:"video_url",videoLink:"video_link",hlsUrl:"hls_url",outputPrefix:"output_prefix",completedAt:"completed_at"};const sets=[],values=[];for(const key of Object.keys(map))if(body[key]!==undefined){sets.push(`${map[key]}=?`);values.push(key==="progress"?Number(body[key]):String(body[key]));}if(!sets.length)return json({error:"No update fields"},400,env);sets.push("updated_at=?");values.push(new Date().toISOString(),jobId);await env.JOB_DB.prepare(`UPDATE transcode_jobs SET ${sets.join(",")} WHERE job_id=?`).bind(...values).run();return json({ok:true,jobId},200,env);}
-async function handleTranscodeStatus(request,env,jobId){let user;try{user=await verifyFirebaseToken(request,env);}catch(e){return unauthorized(env,e.message||"Unauthorized");}await ensureJobsTable(env);const row=await env.JOB_DB.prepare("SELECT * FROM transcode_jobs WHERE job_id=?").bind(jobId).first();if(!row)return json({error:"Job not found"},404,env);if(row.user_id&&row.user_id!==user.sub)return unauthorized(env,"You do not own this job");return json({jobId:row.job_id,status:row.status,progress:row.progress,error:row.error||undefined,videoProvider:row.video_provider||undefined,videoUrl:row.video_url||undefined,videoLink:row.video_link||undefined,hlsUrl:row.hls_url||undefined,outputPrefix:row.output_prefix||undefined,createdAt:row.created_at,updatedAt:row.updated_at,completedAt:row.completed_at||undefined},200,env);}
-async function handleMedia(request,env,key){let decodedKey;try{decodedKey=decodeURIComponent(key);}catch{return new Response("Bad key",{status:400,headers:corsHeaders(env)});}const obj=await env.MEDIA_BUCKET.get(decodedKey,{range:request.headers});if(!obj)return new Response("Not found",{status:404,headers:{...corsHeaders(env),"Cache-Control":"no-store"}});const headers=new Headers();obj.writeHttpMetadata(headers);headers.set("etag",obj.httpEtag);headers.set("Accept-Ranges","bytes");headers.set("Cache-Control","public, max-age=31536000, immutable");if(/\.(mp4|webm|mov|mkv)$/i.test(key))headers.set("Content-Type",key.toLowerCase().endsWith(".mp4")?"video/mp4":(key.toLowerCase().endsWith(".webm")?"video/webm":"video/quicktime"));Object.entries(corsHeaders(env)).forEach(([k,v])=>headers.set(k,v));const status=obj.range?206:200;if(obj.range?.offset!=null&&obj.range?.length!=null){headers.set("Content-Range",`bytes ${obj.range.offset}-${obj.range.offset+obj.range.length-1}/${obj.size}`);headers.set("Content-Length",String(obj.range.length));}else headers.set("Content-Length",String(obj.size));return new Response(request.method==="HEAD"?null:obj.body,{status,headers});}
-export default{async scheduled(){},async fetch(request,env){const url=new URL(request.url);if(request.method==="OPTIONS")return new Response(null,{status:204,headers:corsHeaders(env)});if(url.pathname==="/api/health")return json({ok:true,service:"flaynity-server",videoPipeline:"r2-mp4",ffmpeg:false,hls:false,time:Date.now()},200,env);if(url.pathname==="/api/v1/media/upload-url"&&request.method==="POST")return handleUploadUrl(request,env);if(url.pathname==="/api/v1/transcode/jobs"&&request.method==="POST")return handleCreateTranscodeJob(request,env);
-  if(url.pathname.match(/^\/api\/v1\/transcode\/jobs\/[^/]+$/)&&request.method==="GET")return handleTranscodeStatus(request,env,decodeURIComponent(url.pathname.split("/").pop()));
-  if(url.pathname==="/api/v1/transcode/worker/claim"&&request.method==="POST")return handleWorkerClaim(request,env);
-  if(url.pathname.match(/^\/api\/v1\/transcode\/worker\/jobs\/[^/]+$/)&&request.method==="POST")return handleWorkerUpdate(request,env,decodeURIComponent(url.pathname.split("/").pop()));if(url.pathname.startsWith("/media/")&&(request.method==="GET"||request.method==="HEAD")){const key=decodeURIComponent(url.pathname.slice("/media/".length));if(!/^uploads\//.test(key)||key.includes(".."))return new Response("Bad key",{status:400});return handleMedia(request,env,key);}return json({error:"Not found"},404,env);}};
+
+function json(data, status = 200, env) {
+  const headers = new Headers(JSON_HEADERS);
+  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
+  return new Response(JSON.stringify(data), { status, headers });
+}
+
+function unauthorized(env, message = "Unauthorized") {
+  return json({ error: message }, 401, env);
+}
+
+function base64UrlDecode(value) {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+  const bin = atob(padded);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function decodeJwt(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("Malformed token");
+  const text = new TextDecoder();
+  return {
+    header: JSON.parse(text.decode(base64UrlDecode(parts[0]))),
+    payload: JSON.parse(text.decode(base64UrlDecode(parts[1]))),
+    signature: base64UrlDecode(parts[2]),
+    signingInput: new TextEncoder().encode(`${parts[0]}.${parts[1]}`)
+  };
+}
+
+let certCache = { expiresAt: 0, keys: new Map() };
+const JWKS_CACHE_SECONDS = 300;
+
+async function fetchGoogleJwks(forceRefresh = false) {
+  const url = forceRefresh
+    ? `https://www.googleapis.com/oauth2/v3/certs?flaynity_refresh=${Date.now()}`
+    : "https://www.googleapis.com/oauth2/v3/certs";
+  const response = await fetch(url, {
+    headers: { "Cache-Control": forceRefresh ? "no-cache" : "max-age=300" },
+    ...(forceRefresh ? { cache: "no-store" } : { cf: { cacheTtl: JWKS_CACHE_SECONDS } })
+  });
+  if (!response.ok) throw new Error("Could not load Google signing keys");
+  const body = await response.json();
+  const keys = new Map();
+  for (const jwk of body.keys || []) {
+    if (jwk.kty === "RSA" && jwk.kid && jwk.n && jwk.e) {
+      keys.set(jwk.kid, await crypto.subtle.importKey(
+        "jwk",
+        jwk,
+        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        false,
+        ["verify"]
+      ));
+    }
+  }
+  if (!keys.size) throw new Error("Google signing keys unavailable");
+  const maxAge = Number((response.headers.get("cache-control") || "").match(/max-age=(\d+)/)?.[1] || JWKS_CACHE_SECONDS);
+  certCache = { expiresAt: Date.now() + Math.min(Math.max(maxAge, 60), JWKS_CACHE_SECONDS) * 1000, keys };
+  return keys;
+}
+
+async function getGoogleJwks(forceRefresh = false) {
+  if (!forceRefresh && Date.now() < certCache.expiresAt && certCache.keys.size) return certCache.keys;
+  return fetchGoogleJwks(forceRefresh);
+}
+
+async function verifyFirebaseToken(request, env) {
+  const authHeader = request.headers.get("Authorization") || "";
+  if (!/^Bearer\s+/i.test(authHeader)) throw new Error("Authentication token missing");
+  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!token) throw new Error("Authentication token missing");
+
+  try {
+    const { header, payload, signature, signingInput } = decodeJwt(token);
+    if (header.alg !== "RS256" || !header.kid) throw new Error("Invalid authentication token header");
+    let keys = await getGoogleJwks();
+    let key = keys.get(header.kid);
+    if (!key) {
+      keys = await getGoogleJwks(true);
+      key = keys.get(header.kid);
+    }
+    if (!key) throw new Error("Unknown token key");
+    if (!await crypto.subtle.verify({ name: "RSASSA-PKCS1-v1_5" }, key, signature, signingInput)) {
+      throw new Error("Invalid token signature");
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (!payload.exp || payload.exp <= now) throw new Error("Authentication token expired");
+    if (payload.iat && payload.iat > now + 60) throw new Error("Authentication token issued in the future");
+    if (payload.aud !== env.FIREBASE_PROJECT_ID) throw new Error("Authentication token has wrong audience");
+    if (payload.iss !== `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`) throw new Error("Authentication token has wrong issuer");
+    if (!payload.sub) throw new Error("Authentication token has no user id");
+    return payload;
+  } catch (primaryError) {
+    try {
+      const key = env.FIREBASE_WEB_API_KEY || "AIzaSyCiUTQp_QDSbBIOGJXKI7jJmzQHPu8L14I";
+      const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ idToken: token }),
+        cache: "no-store"
+      });
+      if (response.ok) {
+        const info = await response.json();
+        const account = Array.isArray(info.users) ? info.users[0] : null;
+        if (account?.localId) {
+          return {
+            sub: account.localId,
+            user_id: account.localId,
+            aud: env.FIREBASE_PROJECT_ID,
+            iss: `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`,
+            email: account.email || undefined,
+            email_verified: !!account.emailVerified
+          };
+        }
+      }
+    } catch {}
+    throw primaryError;
+  }
+}
+
+// Accept both the old key format:
+//   uploads/<user>/<file>
+// and the Video/Feels formats:
+//   uploads/videos/<user>/<file>
+//   uploads/feels/<user>/<file>
+function sanitizeKey(input) {
+  const key = String(input || "").replace(/^\/+/, "");
+  if (!key || key.length > 700 || key.includes("..")) return null;
+  if (!/^uploads\/(?:[a-zA-Z0-9_-]+\/){1,2}[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(key)) return null;
+  return key;
+}
+
+function mediaUrl(request, env, key) {
+  // Prefer the same Worker for the public media URL. This prevents an upload
+  // from succeeding in R2 while a separate/stale CDN Worker returns 404.
+  const configured = String(env.MEDIA_BASE_URL || "").trim().replace(/\/$/, "");
+  const requestOrigin = new URL(request.url).origin;
+  const mediaBase = configured && !/cdn\.flaynity\.indevs\.in$/i.test(new URL(configured).hostname)
+    ? configured
+    : `${requestOrigin}/media`;
+  return `${mediaBase}/${key.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+async function createPresignedPut(env, key, contentType) {
+  const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.MEDIA_BUCKET_NAME || "flaynity-storage"}/${key}`;
+  const client = new AwsClient({
+    accessKeyId: env.R2_ACCESS_KEY_ID,
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    service: "s3",
+    region: "auto"
+  });
+
+  // Do not sign Content-Type. WebView/browser implementations sometimes
+  // normalize it differently; signing it made valid Video/Feels uploads fail
+  // even after the file reached 100%.
+  const signed = await client.sign(
+    new Request(`${endpoint}?X-Amz-Expires=${MAX_UPLOAD_EXPIRY}`, { method: "PUT" }),
+    { aws: { signQuery: true } }
+  );
+  return signed.url.toString();
+}
+
+async function handleUploadUrl(request, env) {
+  try {
+    await verifyFirebaseToken(request, env);
+  } catch (e) {
+    return unauthorized(env, e.message || "Unauthorized");
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400, env);
+  }
+
+  const key = sanitizeKey(body.key);
+  const contentType = String(body.contentType || "application/octet-stream").slice(0, 120);
+  if (!key) return json({ error: "Invalid media key" }, 400, env);
+  if (!/^(image|video|audio)\//i.test(contentType)) return json({ error: "Unsupported content type" }, 400, env);
+
+  try {
+    const uploadUrl = await createPresignedPut(env, key, contentType);
+    return json({
+      ok: true,
+      key,
+      uploadUrl,
+      publicUrl: mediaUrl(request, env, key),
+      expiresIn: MAX_UPLOAD_EXPIRY,
+      contentType,
+      videoProvider: /\/(videos|feels)\//i.test(key) ? "r2" : undefined
+    }, 200, env);
+  } catch (e) {
+    return json({ error: e?.message || "Could not create upload URL" }, 500, env);
+  }
+}
+
+async function handleMedia(request, env, key) {
+  const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers });
+  if (!obj) {
+    return new Response("Not found", {
+      status: 404,
+      headers: { ...corsHeaders(env), "Cache-Control": "no-store" }
+    });
+  }
+
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set("etag", obj.httpEtag);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+
+  if (/\.(mp4|webm|mov|mkv)$/i.test(key)) {
+    headers.set(
+      "Content-Type",
+      key.toLowerCase().endsWith(".mp4")
+        ? "video/mp4"
+        : key.toLowerCase().endsWith(".webm")
+          ? "video/webm"
+          : "video/quicktime"
+    );
+  }
+
+  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
+  const status = obj.range ? 206 : 200;
+
+  if (obj.range?.offset != null && obj.range?.length != null) {
+    headers.set("Content-Range", `bytes ${obj.range.offset}-${obj.range.offset + obj.range.length - 1}/${obj.size}`);
+    headers.set("Content-Length", String(obj.range.length));
+  } else {
+    headers.set("Content-Length", String(obj.size));
+  }
+
+  return new Response(request.method === "HEAD" ? null : obj.body, { status, headers });
+}
+
+export default {
+  async scheduled() {},
+
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(env) });
+    }
+
+    if (url.pathname === "/api/health") {
+      return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-mp4", ffmpeg: false, hls: false, time: Date.now() }, 200, env);
+    }
+
+    if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") {
+      return handleUploadUrl(request, env);
+    }
+
+    if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {
+      let key;
+      try {
+        key = decodeURIComponent(url.pathname.slice("/media/".length));
+      } catch {
+        return new Response("Bad key", { status: 400, headers: corsHeaders(env) });
+      }
+      if (!/^uploads\//.test(key) || key.includes("..")) {
+        return new Response("Bad key", { status: 400, headers: corsHeaders(env) });
+      }
+      return handleMedia(request, env, key);
+    }
+
+    return json({ error: "Not found" }, 404, env);
+  }
+};

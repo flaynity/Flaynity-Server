@@ -257,7 +257,7 @@ async function handleTranscodeJob(request, env) {
   const sourceKey = String(body.sourceKey || "").replace(/^\/+/, "");
   const jobId = body.jobId ? String(body.jobId).trim() : undefined;
 
-  if (!/^uploads\/(?:videos|feels)\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/i.test(sourceKey)) {
+  if (!/^uploads\/(?:videos|feels)\/(?:[a-zA-Z0-9_-]+\/)?[a-zA-Z0-9][a-zA-Z0-9._-]*$/i.test(sourceKey)) {
     return json({ error: "Invalid video source key" }, 400, env);
   }
 

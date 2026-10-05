@@ -3,22 +3,15 @@ main = "index.js"
 compatibility_date = "2026-09-09"
 workers_dev = true
 
-
-# IMPORTANT: Use the existing Flaynity R2 bucket.
 [[r2_buckets]]
 binding = "MEDIA_BUCKET"
 bucket_name = "flaynity-storage"
-
-[[d1_databases]]
-binding = "JOB_DB"
-database_name = "flaynity-transcode-jobs"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 
 [vars]
 APP_ORIGIN = "https://flaynity.indevs.in"
 FIREBASE_PROJECT_ID = "flaynity-app"
 R2_ACCOUNT_ID = "b3741135bd1f3e96b6744f11e6a06600"
 MEDIA_BUCKET_NAME = "flaynity-storage"
+# The server itself now serves the public /media route, avoiding a stale
+# separate CDN Worker causing "Not found" after a successful upload.
 MEDIA_BASE_URL = "https://api.flaynity.indevs.in/media"
-
-# Set with: wrangler secret put TRANSCODER_WORKER_SECRET

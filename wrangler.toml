@@ -15,3 +15,7 @@ MEDIA_BUCKET_NAME = "flaynity-storage"
 # The server itself now serves the public /media route, avoiding a stale
 # separate CDN Worker causing "Not found" after a successful upload.
 MEDIA_BASE_URL = "https://api.flaynity.indevs.in/media"
+
+# Modal GPU transcoding endpoints
+GPU_CREATE_JOB_URL = "https://flaynity--flaynity-gpu-server-create-job.modal.run"
+GPU_JOB_STATUS_URL = "https://flaynity--flaynity-gpu-server-job-status.modal.run"

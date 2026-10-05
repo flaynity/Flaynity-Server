@@ -63,8 +63,14 @@ async function handleTranscodeStart(request, env){
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({jobId,sourceUrl})
     });
-    const data=await response.json().catch(()=>({}));
-    if(!response.ok) { const detail=data.error||data.message||`GPU transcoder returned HTTP ${response.status}.`; if(response.status===401) return json({error:"GPU transcoder authentication failed. Check the Worker secret GPU_TRANSCODER_API_KEY against the current GPU TRANSCODER_API_KEY."},502,env); return json({error:`GPU transcoder returned HTTP ${response.status}: ${detail}`},502,env); }
+    const raw=await response.text();
+    let data={};
+    try{ data=raw ? JSON.parse(raw) : {}; }catch{}
+    if(!response.ok) {
+      const detail=data.error||data.message||raw.trim()||"No error details returned by the GPU transcoder.";
+      if(response.status===401) return json({error:"GPU transcoder authentication failed (HTTP 401). The Worker secret GPU_TRANSCODER_API_KEY does not match the GPU server key."},502,env);
+      return json({error:`GPU transcoder returned HTTP ${response.status}: ${detail}`},502,env);
+    }
     return json({jobId:data.jobId||jobId,status:data.status||"queued",sourceKey},202,env);
   }catch(e){
     return json({error:e?.message||"Could not reach GPU transcoder."},502,env);

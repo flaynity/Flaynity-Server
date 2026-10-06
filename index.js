@@ -211,98 +211,6 @@ async function handleUploadUrl(request, env) {
   }
 }
 
-async function gpuRequest(env, endpointEnv, options = {}) {
-  const endpoint = String(options.url || env[endpointEnv] || "").trim();
-  const token = String(env.GPU_SERVER_TOKEN || "").trim();
-  if (!endpoint) throw new Error(`${endpointEnv} is not configured`);
-  if (!token) throw new Error("GPU_SERVER_TOKEN is not configured");
-
-  const headers = new Headers(options.headers || {});
-  headers.set("Authorization", `Bearer ${token}`);
-  if (options.body != null && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
-
-  const response = await fetch(endpoint, { ...options, headers });
-  const text = await response.text();
-  let data;
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(`GPU server returned non-JSON response (HTTP ${response.status})`);
-  }
-
-  if (!response.ok) {
-    const message = data?.detail || data?.error || data?.message ||
-      `GPU server request failed (HTTP ${response.status})`;
-    throw new Error(String(message));
-  }
-  return data;
-}
-
-async function handleTranscodeJob(request, env) {
-  try {
-    await verifyFirebaseToken(request, env);
-  } catch (e) {
-    return unauthorized(env, e.message || "Unauthorized");
-  }
-
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: "Invalid JSON" }, 400, env);
-  }
-
-  const sourceKey = String(body.sourceKey || "").replace(/^\/+/, "");
-  const jobId = body.jobId ? String(body.jobId).trim() : undefined;
-
-  if (!/^uploads\/(?:videos|feels)\/(?:[a-zA-Z0-9_-]+\/)?[a-zA-Z0-9][a-zA-Z0-9._-]*$/i.test(sourceKey)) {
-    return json({ error: "Invalid video source key" }, 400, env);
-  }
-
-  if (jobId && !/^[a-zA-Z0-9_-]{1,120}$/.test(jobId)) {
-    return json({ error: "Invalid job ID" }, 400, env);
-  }
-
-  try {
-    const data = await gpuRequest(env, "GPU_CREATE_JOB_URL", {
-      method: "POST",
-      body: JSON.stringify({ sourceKey, ...(jobId ? { jobId } : {}) })
-    });
-
-    return json({ ok: true, gpu: data, videoProvider: "r2-hls", sourceKey }, 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not start video transcoding" }, 502, env);
-  }
-}
-
-async function handleTranscodeStatus(request, env) {
-  try {
-    await verifyFirebaseToken(request, env);
-  } catch (e) {
-    return unauthorized(env, e.message || "Unauthorized");
-  }
-
-  const callId = new URL(request.url).searchParams.get("callId")?.trim();
-  if (!callId || !/^[a-zA-Z0-9._:-]{1,300}$/.test(callId)) {
-    return json({ error: "Invalid callId" }, 400, env);
-  }
-
-  try {
-    const endpoint = String(env.GPU_JOB_STATUS_URL || "").trim();
-    if (!endpoint) throw new Error("GPU_JOB_STATUS_URL is not configured");
-    const statusUrl = new URL(endpoint);
-    statusUrl.searchParams.set("callId", callId);
-    return json(await gpuRequest(env, "GPU_JOB_STATUS_URL", {
-      method: "GET",
-      url: statusUrl.toString()
-    }), 200, env);
-  } catch (e) {
-    return json({ error: e?.message || "Could not read video transcoding status" }, 502, env);
-  }
-}
-
 async function handleMedia(request, env, key) {
   const obj = await env.MEDIA_BUCKET.get(key, { range: request.headers });
   if (!obj) {
@@ -353,27 +261,11 @@ export default {
     }
 
     if (url.pathname === "/api/health") {
-      return json({
-        ok: true,
-        service: "flaynity-server",
-        videoPipeline: env.GPU_CREATE_JOB_URL && env.GPU_JOB_STATUS_URL ? "gpu-r2-hls" : "r2-mp4",
-        gpuServer: !!(env.GPU_CREATE_JOB_URL && env.GPU_JOB_STATUS_URL),
-        ffmpeg: false,
-        hls: !!(env.GPU_CREATE_JOB_URL && env.GPU_JOB_STATUS_URL),
-        time: Date.now()
-      }, 200, env);
+      return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-mp4", ffmpeg: false, hls: false, time: Date.now() }, 200, env);
     }
 
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") {
       return handleUploadUrl(request, env);
-    }
-
-    if (url.pathname === "/api/v1/media/transcode" && request.method === "POST") {
-      return handleTranscodeJob(request, env);
-    }
-
-    if (url.pathname === "/api/v1/media/transcode-status" && request.method === "GET") {
-      return handleTranscodeStatus(request, env);
     }
 
     if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {

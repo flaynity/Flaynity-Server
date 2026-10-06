@@ -5,8 +5,3 @@ FFMPEG_PROCESSOR_URL=
 FFMPEG_PROCESSOR_TOKEN=
 FIREBASE_DATABASE_URL=
 FIREBASE_SERVICE_ACCOUNT=
-
-# Modal GPU Server endpoints
-GPU_CREATE_JOB_URL=https://flaynity--flaynity-gpu-server-create-job.modal.run
-GPU_JOB_STATUS_URL=https://flaynity--flaynity-gpu-server-job-status.modal.run
-GPU_SERVER_TOKEN=

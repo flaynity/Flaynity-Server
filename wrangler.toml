@@ -8,10 +8,10 @@ binding = "MEDIA_BUCKET"
 bucket_name = "flaynity-storage"
 
 [vars]
-APP_ORIGIN = "https://flaynity.indevs.in"
+APP_ORIGIN = "https://flaynity-app.indevs.in"
 FIREBASE_PROJECT_ID = "flaynity-app"
 R2_ACCOUNT_ID = "b3741135bd1f3e96b6744f11e6a06600"
 MEDIA_BUCKET_NAME = "flaynity-storage"
 # The server itself now serves the public /media route, avoiding a stale
 # separate CDN Worker causing "Not found" after a successful upload.
-MEDIA_BASE_URL = "https://api.flaynity.indevs.in/media"
+MEDIA_BASE_URL = "https://api.flaynity-app.indevs.in/media"

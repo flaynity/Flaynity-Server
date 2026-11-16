@@ -5,7 +5,7 @@ const MAX_UPLOAD_EXPIRY = 900;
 
 function corsHeaders(env) {
   return {
-    "Access-Control-Allow-Origin": env.APP_ORIGIN || "https://flaynity.indevs.in",
+    "Access-Control-Allow-Origin": env.APP_ORIGIN || "https://flaynity-app.indevs.in",
     "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type,Range,X-Requested-With",
     "Access-Control-Expose-Headers": "Accept-Ranges,Content-Length,Content-Range,ETag,Content-Type",

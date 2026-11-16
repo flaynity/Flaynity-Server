@@ -1,8 +1,8 @@
 [
   {
     "AllowedOrigins": [
-      "https://flaynity.indevs.in",
-      "https://www.flaynity.indevs.in"
+      "https://flaynity-app.indevs.in",
+      "https://www.flaynity-app.indevs.in"
     ],
     "AllowedMethods": [
       "GET",

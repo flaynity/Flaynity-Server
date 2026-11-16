@@ -28,9 +28,9 @@ Flaynity-Server মূলত:
 - Existing R2 bucket: `flaynity-storage`
 - Cloudflare account ID: `b3741135bd1f3e96b6744f11e6a06600`
 - Firebase project: `flaynity-app`
-- Website: `https://flaynity.indevs.in`
-- API Worker domain: `https://api.flaynity.indevs.in`
-- CDN Worker domain: `https://cdn.flaynity.indevs.in`
+- Website: `https://flaynity-app.indevs.in`
+- API Worker domain: `https://api.flaynity-app.indevs.in`
+- CDN Worker domain: `https://cdn.flaynity-app.indevs.in`
 
 ---
 
@@ -70,11 +70,11 @@ binding = "MEDIA_BUCKET"
 bucket_name = "flaynity-storage"
 
 [vars]
-APP_ORIGIN = "https://flaynity.indevs.in"
+APP_ORIGIN = "https://flaynity-app.indevs.in"
 FIREBASE_PROJECT_ID = "flaynity-app"
 R2_ACCOUNT_ID = "b3741135bd1f3e96b6744f11e6a06600"
 MEDIA_BUCKET_NAME = "flaynity-storage"
-MEDIA_BASE_URL = "https://cdn.flaynity.indevs.in/media"
+MEDIA_BASE_URL = "https://cdn.flaynity-app.indevs.in/media"
 ```
 
 **এই values পরিবর্তন করবেন না**, যদি Flaynity-এর বর্তমান domain/bucket একই থাকে।
@@ -228,10 +228,10 @@ Value হবে আপনার existing `js/firebase-config.js`-এর Firebase
 Deploy-এর পরে Worker-এর domain/API route অবশ্যই এই service-এর দিকে যেতে হবে:
 
 ```text
-https://api.flaynity.indevs.in
+https://api.flaynity-app.indevs.in
 ```
 
-যদি custom domain/route ব্যবহার করেন, `api.flaynity.indevs.in`-কে `flaynity-server` Worker-এর সাথে connect করুন।
+যদি custom domain/route ব্যবহার করেন, `api.flaynity-app.indevs.in`-কে `flaynity-server` Worker-এর সাথে connect করুন।
 
 ---
 
@@ -240,7 +240,7 @@ https://api.flaynity.indevs.in
 Browser-এ খুলুন:
 
 ```text
-https://api.flaynity.indevs.in/api/health
+https://api.flaynity-app.indevs.in/api/health
 ```
 
 সঠিক হলে JSON response-এর মধ্যে এমন তথ্য থাকবে:
@@ -261,13 +261,13 @@ https://api.flaynity.indevs.in/api/health
 Flaynity media delivery হবে:
 
 ```text
-https://cdn.flaynity.indevs.in/media/<object-key>
+https://cdn.flaynity-app.indevs.in/media/<object-key>
 ```
 
 উদাহরণ:
 
 ```text
-https://cdn.flaynity.indevs.in/media/uploads/posts/example.jpg
+https://cdn.flaynity-app.indevs.in/media/uploads/posts/example.jpg
 ```
 
 Object না থাকলে `Not found` আসা স্বাভাবিক।
@@ -279,7 +279,7 @@ Object না থাকলে `Not found` আসা স্বাভাবিক�
 R2 bucket-এর CORS configuration-এ Flaynity website origin allow করতে হবে। বর্তমান setup-এর জন্য মূল origin:
 
 ```text
-https://flaynity.indevs.in
+https://flaynity-app.indevs.in
 ```
 
 বর্তমান upload flow-এর জন্য অন্তত `PUT` এবং `Content-Type` প্রয়োজন। উদাহরণ:
@@ -288,7 +288,7 @@ https://flaynity.indevs.in
 [
   {
     "AllowedOrigins": [
-      "https://flaynity.indevs.in"
+      "https://flaynity-app.indevs.in"
     ],
     "AllowedMethods": [
       "PUT"
@@ -324,10 +324,10 @@ Flaynity client-side code-এ API/CDN base URL হবে:
 
 ```text
 API:
-https://api.flaynity.indevs.in/api
+https://api.flaynity-app.indevs.in/api
 
 Media:
-https://cdn.flaynity.indevs.in/media
+https://cdn.flaynity-app.indevs.in/media
 ```
 
 Client upload করার সময় Firebase logged-in user-এর ID token পাঠাবে। Server token verify করে signed R2 upload URL তৈরি করবে। তারপর browser সরাসরি R2-তে file upload করবে।
@@ -343,7 +343,7 @@ Flaynity App
      │
      │ Firebase ID Token
      ▼
-api.flaynity.indevs.in
+api.flaynity-app.indevs.in
      │
      │ Verify user
      │ Create signed upload URL
@@ -353,7 +353,7 @@ flaynity-storage
      │
      │ Stored media
      ▼
-cdn.flaynity.indevs.in
+cdn.flaynity-app.indevs.in
      │
      ▼
 Flaynity App
@@ -394,7 +394,7 @@ Secrets আবার code-এর মধ্যে লিখবেন না।
 Deploy করার পরে অবশ্যই:
 
 ```text
-https://api.flaynity.indevs.in/api/health
+https://api.flaynity-app.indevs.in/api/health
 ```
 
 চেক করবেন।
@@ -418,7 +418,7 @@ https://api.flaynity.indevs.in/api/health
 - [ ] 11. `APP_ORIGIN` ঠিক আছে কিনা দেখুন
 - [ ] 12. `MEDIA_BASE_URL` ঠিক আছে কিনা দেখুন
 - [ ] 13. R2 CORS check করুন
-- [ ] 14. `api.flaynity.indevs.in` Worker-এর সাথে connect করুন
+- [ ] 14. `api.flaynity-app.indevs.in` Worker-এর সাথে connect করুন
 - [ ] 15. Deploy করুন
 - [ ] 16. `/api/health` খুলে test করুন
 - [ ] 17. Flaynity app-এ login করুন
@@ -490,7 +490,7 @@ R2_SECRET_ACCESS_KEY → set
 Website origin এবং R2 CORS configuration check করুন। Website origin:
 
 ```text
-https://flaynity.indevs.in
+https://flaynity-app.indevs.in
 ```
 
 ---
@@ -499,19 +499,19 @@ https://flaynity.indevs.in
 
 ```text
 Website
-https://flaynity.indevs.in
+https://flaynity-app.indevs.in
 
 API Worker
-https://api.flaynity.indevs.in
+https://api.flaynity-app.indevs.in
 
 API health
-https://api.flaynity.indevs.in/api/health
+https://api.flaynity-app.indevs.in/api/health
 
 CDN Worker
-https://cdn.flaynity.indevs.in
+https://cdn.flaynity-app.indevs.in
 
 Media base
-https://cdn.flaynity.indevs.in/media
+https://cdn.flaynity-app.indevs.in/media
 
 Worker name
 flaynity-server

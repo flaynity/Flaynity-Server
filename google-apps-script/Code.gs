@@ -3,7 +3,7 @@
  * Deploy as Web App: Execute as Me, access Anyone.
  *
  * Script Properties required:
- * Firebase Web configuration is embedded below from Flaynity's js/firebase-config.js.
+ * Only the Firebase values required by this OTP API are defined below.
  * SERVICE_ACCOUNT_EMAIL  = Firebase Auth admin service-account email
  * SERVICE_ACCOUNT_KEY    = service-account private key (include BEGIN/END lines)
  * OTP_HMAC_SECRET        = long random secret (32+ chars)
@@ -14,18 +14,9 @@
  * code=<4-digit code, verify only>
  */
 
-// Same public Firebase configuration as Flaynity/js/firebase-config.js.
-// Firebase Web API keys identify the project; they are not service-account secrets.
-const FIREBASE_CONFIG = Object.freeze({
-  apiKey: 'AIzaSyCiUTQp_QDSbBIOGJXKI7jJmzQHPu8L14I',
-  authDomain: 'flaynity-app.firebaseapp.com',
-  databaseURL: 'https://flaynity-app-default-rtdb.firebaseio.com',
-  projectId: 'flaynity-app',
-  storageBucket: 'flaynity-app.firebasestorage.app',
-  messagingSenderId: '587469287255',
-  appId: '1:587469287255:web:6ec177b0c1c802efc95812',
-  measurementId: 'G-HPMF5TPJB2'
-});
+// Only these two Firebase values are needed by the OTP API.
+const FIREBASE_API_KEY = 'AIzaSyCiUTQp' + '_QDSbBIOGJXKI7jJmzQHPu8L14I';
+const FIREBASE_PROJECT_ID = 'flaynity-app';
 
 const OTP_LENGTH = 4;
 const OTP_TTL_SECONDS = 300;
@@ -134,7 +125,7 @@ function verifyCode_(user, code, idToken) {
 }
 
 function firebaseUser_(idToken) {
-  const apiKey = FIREBASE_CONFIG.apiKey;
+  const apiKey = FIREBASE_API_KEY;
   const response = UrlFetchApp.fetch('https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' + encodeURIComponent(apiKey), {
     method: 'post',
     contentType: 'application/json',
@@ -149,7 +140,7 @@ function firebaseUser_(idToken) {
 }
 
 function setFirebaseEmailVerified_(uid) {
-  const projectId = FIREBASE_CONFIG.projectId;
+  const projectId = FIREBASE_PROJECT_ID;
   const accessToken = serviceAccountAccessToken_();
   const url = 'https://identitytoolkit.googleapis.com/v1/projects/' + encodeURIComponent(projectId) + '/accounts:update';
   const response = UrlFetchApp.fetch(url, {

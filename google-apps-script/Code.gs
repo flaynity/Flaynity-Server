@@ -3,8 +3,7 @@
  * Deploy as Web App: Execute as Me, access Anyone.
  *
  * Script Properties required:
- * FIREBASE_API_KEY       = Firebase Web API key
- * FIREBASE_PROJECT_ID    = flaynity-app
+ * Firebase Web configuration is embedded below from Flaynity's js/firebase-config.js.
  * SERVICE_ACCOUNT_EMAIL  = Firebase Auth admin service-account email
  * SERVICE_ACCOUNT_KEY    = service-account private key (include BEGIN/END lines)
  * OTP_HMAC_SECRET        = long random secret (32+ chars)
@@ -14,6 +13,19 @@
  * idToken=<Firebase ID token>
  * code=<4-digit code, verify only>
  */
+
+// Same public Firebase configuration as Flaynity/js/firebase-config.js.
+// Firebase Web API keys identify the project; they are not service-account secrets.
+const FIREBASE_CONFIG = Object.freeze({
+  apiKey: 'AIzaSyCiUTQp_QDSbBIOGJXKI7jJmzQHPu8L14I',
+  authDomain: 'flaynity-app.firebaseapp.com',
+  databaseURL: 'https://flaynity-app-default-rtdb.firebaseio.com',
+  projectId: 'flaynity-app',
+  storageBucket: 'flaynity-app.firebasestorage.app',
+  messagingSenderId: '587469287255',
+  appId: '1:587469287255:web:6ec177b0c1c802efc95812',
+  measurementId: 'G-HPMF5TPJB2'
+});
 
 const OTP_LENGTH = 4;
 const OTP_TTL_SECONDS = 300;
@@ -122,7 +134,7 @@ function verifyCode_(user, code, idToken) {
 }
 
 function firebaseUser_(idToken) {
-  const apiKey = required_('FIREBASE_API_KEY');
+  const apiKey = FIREBASE_CONFIG.apiKey;
   const response = UrlFetchApp.fetch('https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' + encodeURIComponent(apiKey), {
     method: 'post',
     contentType: 'application/json',
@@ -137,7 +149,7 @@ function firebaseUser_(idToken) {
 }
 
 function setFirebaseEmailVerified_(uid) {
-  const projectId = required_('FIREBASE_PROJECT_ID');
+  const projectId = FIREBASE_CONFIG.projectId;
   const accessToken = serviceAccountAccessToken_();
   const url = 'https://identitytoolkit.googleapis.com/v1/projects/' + encodeURIComponent(projectId) + '/accounts:update';
   const response = UrlFetchApp.fetch(url, {

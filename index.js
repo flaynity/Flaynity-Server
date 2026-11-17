@@ -134,16 +134,31 @@ async function verifyFirebaseToken(request, env) {
   }
 }
 
-// Accept both the old key format:
-//   uploads/<user>/<file>
-// and the Video/Feels formats:
-//   uploads/videos/<user>/<file>
-//   uploads/feels/<user>/<file>
+// Accept legacy media keys and nested HLS package paths, for example:
+// uploads/videos/<user>/<video>/hls/360p/segment_00001.ts
 function sanitizeKey(input) {
-  const key = String(input || "").replace(/^\/+/, "");
-  if (!key || key.length > 700 || key.includes("..")) return null;
-  if (!/^uploads\/(?:[a-zA-Z0-9_-]+\/){1,2}[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(key)) return null;
+  const key = String(input || "").replace(/^\\/+/, "");
+  if (!key || key.length > 700 || key.includes("..") || key.includes("\\\\") || /[?#%]/.test(key)) return null;
+  const parts = key.split("/");
+  if (parts.length < 3 || parts.length > 8 || parts[0] !== "uploads") return null;
+  if (parts.some(part => !part || part === "." || part === ".." || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(part))) return null;
   return key;
+}
+
+function allowedMediaContentType(key, requested) {
+  const ext = key.split(".").pop().toLowerCase();
+  const type = String(requested || "").toLowerCase().split(";")[0].trim();
+  const allowed = {
+    m3u8: ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl"],
+    ts: ["video/mp2t", "application/octet-stream"],
+    m4s: ["video/iso.segment", "application/octet-stream"],
+    mp4: ["video/mp4", "application/octet-stream"],
+    m4a: ["audio/mp4", "application/octet-stream"],
+    aac: ["audio/aac", "application/octet-stream"],
+    key: ["application/octet-stream"]
+  };
+  if (allowed[ext]) return allowed[ext].includes(type);
+  return /^(image|video|audio)\\//i.test(type);
 }
 
 function mediaUrl(request, env, key) {
@@ -226,15 +241,17 @@ async function handleMedia(request, env, key) {
   headers.set("Accept-Ranges", "bytes");
   headers.set("Cache-Control", "public, max-age=31536000, immutable");
 
-  if (/\.(mp4|webm|mov|mkv)$/i.test(key)) {
-    headers.set(
-      "Content-Type",
-      key.toLowerCase().endsWith(".mp4")
-        ? "video/mp4"
-        : key.toLowerCase().endsWith(".webm")
-          ? "video/webm"
-          : "video/quicktime"
-    );
+  const lowerKey = key.toLowerCase();
+  if (lowerKey.endsWith(".m3u8")) {
+    headers.set("Content-Type", "application/vnd.apple.mpegurl");
+    headers.set("Cache-Control", "public, max-age=30, must-revalidate");
+  } else if (lowerKey.endsWith(".ts")) {
+    headers.set("Content-Type", "video/mp2t");
+  } else if (lowerKey.endsWith(".m4s")) {
+    headers.set("Content-Type", "video/iso.segment");
+  } else if (/\\.(mp4|webm|mov|mkv)$/i.test(key)) {
+    headers.set("Content-Type", lowerKey.endsWith(".mp4") ? "video/mp4" :
+      lowerKey.endsWith(".webm") ? "video/webm" : "video/quicktime");
   }
 
   Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
@@ -261,7 +278,7 @@ export default {
     }
 
     if (url.pathname === "/api/health") {
-      return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-mp4", ffmpeg: false, hls: false, time: Date.now() }, 200, env);
+      return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-hls-storage", ffmpeg: false, hls: true, hlsEncoding: "on-device-required", time: Date.now() }, 200, env);
     }
 
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") {

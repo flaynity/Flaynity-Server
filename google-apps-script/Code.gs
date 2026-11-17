@@ -85,6 +85,7 @@ function sendCode_(user) {
       to: user.email,
       subject: 'Your Flaynity verification code',
       name: 'Flaynity',
+      replyTo: 'xflaystudio@gmail.com',
       body: 'Your Flaynity verification code is ' + code + '. It expires in 5 minutes. If you did not create a Flaynity account, ignore this email.',
       htmlBody: '<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;color:#171717"><h2 style="margin:0 0 12px">Verify your Flaynity email</h2><p>Use this code to finish creating your account:</p><div style="font-size:34px;font-weight:800;letter-spacing:10px;padding:18px 0">' + code + '</div><p>This code expires in <b>5 minutes</b>. Do not share it with anyone.</p><p style="color:#777;font-size:12px">If you did not create a Flaynity account, you can ignore this email.</p></div>'
     });

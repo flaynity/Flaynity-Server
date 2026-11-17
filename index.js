@@ -208,7 +208,7 @@ async function handleUploadUrl(request, env) {
   const key = sanitizeKey(body.key);
   const contentType = String(body.contentType || "application/octet-stream").slice(0, 120);
   if (!key) return json({ error: "Invalid media key" }, 400, env);
-  if (!/^(image|video|audio)\//i.test(contentType)) return json({ error: "Unsupported content type" }, 400, env);
+  if (!allowedMediaContentType(key, contentType)) return json({ error: "Unsupported content type for media file" }, 400, env);
 
   try {
     const uploadUrl = await createPresignedPut(env, key, contentType);

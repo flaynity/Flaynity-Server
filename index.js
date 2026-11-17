@@ -137,8 +137,8 @@ async function verifyFirebaseToken(request, env) {
 // Accept legacy media keys and nested HLS package paths, for example:
 // uploads/videos/<user>/<video>/hls/360p/segment_00001.ts
 function sanitizeKey(input) {
-  const key = String(input || "").replace(/^\\/+/, "");
-  if (!key || key.length > 700 || key.includes("..") || key.includes("\\\\") || /[?#%]/.test(key)) return null;
+  const key = String(input || "").replace(/^\/+/, "");
+  if (!key || key.length > 700 || key.includes("\\") || key.includes("..") || /[?#%]/.test(key)) return null;
   const parts = key.split("/");
   if (parts.length < 3 || parts.length > 8 || parts[0] !== "uploads") return null;
   if (parts.some(part => !part || part === "." || part === ".." || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(part))) return null;
@@ -158,7 +158,7 @@ function allowedMediaContentType(key, requested) {
     key: ["application/octet-stream"]
   };
   if (allowed[ext]) return allowed[ext].includes(type);
-  return /^(image|video|audio)\\//i.test(type);
+  return /^(image|video|audio)\//i.test(type);
 }
 
 function mediaUrl(request, env, key) {
@@ -249,7 +249,7 @@ async function handleMedia(request, env, key) {
     headers.set("Content-Type", "video/mp2t");
   } else if (lowerKey.endsWith(".m4s")) {
     headers.set("Content-Type", "video/iso.segment");
-  } else if (/\\.(mp4|webm|mov|mkv)$/i.test(key)) {
+  } else if (/\.(mp4|webm|mov|mkv)$/i.test(key)) {
     headers.set("Content-Type", lowerKey.endsWith(".mp4") ? "video/mp4" :
       lowerKey.endsWith(".webm") ? "video/webm" : "video/quicktime");
   }

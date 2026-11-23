@@ -226,12 +226,22 @@ async function handleMedia(request, env, key) {
   headers.set("Accept-Ranges", "bytes");
   headers.set("Cache-Control", "public, max-age=31536000, immutable");
 
-  if (/\.(mp4|webm|mov|mkv)$/i.test(key)) {
+  const lowerKey = key.toLowerCase();
+  if (lowerKey.endsWith(".m3u8")) {
+    headers.set("Content-Type", "application/vnd.apple.mpegurl");
+    headers.set("Cache-Control", "public, max-age=3600");
+  } else if (lowerKey.endsWith(".ts")) {
+    headers.set("Content-Type", "video/MP2T");
+    headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  } else if (lowerKey.endsWith(".json")) {
+    headers.set("Content-Type", "application/json; charset=utf-8");
+    headers.set("Cache-Control", "no-store");
+  } else if (/\.(mp4|webm|mov|mkv)$/i.test(lowerKey)) {
     headers.set(
       "Content-Type",
-      key.toLowerCase().endsWith(".mp4")
+      lowerKey.endsWith(".mp4")
         ? "video/mp4"
-        : key.toLowerCase().endsWith(".webm")
+        : lowerKey.endsWith(".webm")
           ? "video/webm"
           : "video/quicktime"
     );
@@ -250,6 +260,90 @@ async function handleMedia(request, env, key) {
   return new Response(request.method === "HEAD" ? null : obj.body, { status, headers });
 }
 
+async function handleStartHlsTranscode(request, env) {
+  try {
+    await verifyFirebaseToken(request, env);
+  } catch (e) {
+    return unauthorized(env, e.message || "Unauthorized");
+  }
+
+  if (!env.MODAL_TRANSCODE_URL || !env.GPU_WEBHOOK_SECRET) {
+    return json({ ok: false, error: "GPU transcoder is not configured" }, 503, env);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: "Invalid JSON" }, 400, env);
+  }
+
+  const inputKey = String(body.inputKey || body.key || "").trim().replace(/^\/+/, "");
+  if (!inputKey || inputKey.includes("..") || !/^uploads\//.test(inputKey)) {
+    return json({ ok: false, error: "Invalid inputKey" }, 400, env);
+  }
+
+  const headObj = await env.MEDIA_BUCKET.head(inputKey);
+  if (!headObj) {
+    return json({ ok: false, error: "Source video not found in R2" }, 404, env);
+  }
+
+  const rawJobId = String(body.jobId || `job_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`);
+  const jobId = rawJobId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 96);
+  if (!jobId) {
+    return json({ ok: false, error: "Invalid jobId" }, 400, env);
+  }
+
+  const modalResponse = await fetch(env.MODAL_TRANSCODE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      secret: env.GPU_WEBHOOK_SECRET,
+      jobId,
+      inputKey,
+      qualities: Array.isArray(body.qualities) && body.qualities.length
+        ? body.qualities
+        : ["360p", "480p", "720p", "1080p"],
+      deleteOriginal: Boolean(body.deleteOriginal)
+    })
+  });
+
+  const modalData = await modalResponse.json().catch(() => ({}));
+  if (!modalResponse.ok) {
+    return json({
+      ok: false,
+      error: "Failed to queue GPU transcode job",
+      details: modalData
+    }, 502, env);
+  }
+
+  const masterKey = `uploads/hls/${jobId}/master.m3u8`;
+  const statusKey = `uploads/hls/${jobId}/status.json`;
+  return json({
+    ok: true,
+    jobId,
+    status: modalData.status || "queued",
+    masterUrl: modalData.masterUrl || mediaUrl(request, env, masterKey),
+    statusUrl: modalData.statusUrl || mediaUrl(request, env, statusKey)
+  }, 202, env);
+}
+
+async function handleGetHlsStatus(request, env, rawJobId) {
+  const jobId = String(rawJobId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 96);
+  if (!jobId) {
+    return json({ ok: false, error: "Invalid jobId" }, 400, env);
+  }
+
+  const obj = await env.MEDIA_BUCKET.get(`uploads/hls/${jobId}/status.json`);
+  if (!obj) {
+    return json({ ok: false, status: "not_found", jobId }, 404, env);
+  }
+
+  const headers = new Headers(JSON_HEADERS);
+  Object.entries(corsHeaders(env)).forEach(([k, v]) => headers.set(k, v));
+  return new Response(obj.body, { status: 200, headers });
+}
+
 export default {
   async scheduled() {},
 
@@ -260,12 +354,29 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(env) });
     }
 
-    if (url.pathname === "/api/health") {
-      return json({ ok: true, service: "flaynity-server", videoPipeline: "r2-mp4", ffmpeg: false, hls: false, time: Date.now() }, 200, env);
+    if (url.pathname === "/api/health" || url.pathname === "/health") {
+      return json({
+        ok: true,
+        service: "flaynity-server",
+        videoPipeline: "r2-hls-modal",
+        ffmpeg: true,
+        hls: true,
+        gpuConfigured: Boolean(env.MODAL_TRANSCODE_URL && env.GPU_WEBHOOK_SECRET),
+        time: Date.now()
+      }, 200, env);
     }
 
     if (url.pathname === "/api/v1/media/upload-url" && request.method === "POST") {
       return handleUploadUrl(request, env);
+    }
+
+    if ((url.pathname === "/api/v1/transcode/hls" || url.pathname === "/transcode/hls") && request.method === "POST") {
+      return handleStartHlsTranscode(request, env);
+    }
+
+    if ((url.pathname.startsWith("/api/v1/transcode/status/") || url.pathname.startsWith("/transcode/status/")) && request.method === "GET") {
+      const jobId = url.pathname.replace(/^\/(?:api\/v1\/)?transcode\/status\//, "");
+      return handleGetHlsStatus(request, env, jobId);
     }
 
     if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) {

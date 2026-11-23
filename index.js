@@ -303,8 +303,8 @@ async function handleStartHlsTranscode(request, env) {
       inputKey,
       qualities: Array.isArray(body.qualities) && body.qualities.length
         ? body.qualities
-        : ["360p", "480p", "720p", "1080p"],
-      deleteOriginal: Boolean(body.deleteOriginal)
+        : ["360p", "480p", "720p"],
+      deleteOriginal: body.deleteOriginal === undefined ? true : Boolean(body.deleteOriginal)
     })
   });
 
